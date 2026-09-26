@@ -1,12 +1,14 @@
 """Small desktop launcher. Generation runs in a separate, cancellable process."""
 from datetime import datetime
 import json
+import math
 import os
 from pathlib import Path
 import queue
 import subprocess
 import sys
 import threading
+import time
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 from .seeds import resolve_seed
@@ -32,19 +34,26 @@ def python_executable():
     return str(console if path.name.lower() == "pythonw.exe" and console.exists() else path)
 
 
-def build_command(folder, seed, draft="", coarse_height=8, ocean_depth=0., white_metres=4000., device="cpu", refinement=.2):
+def build_command(folder, seed, draft="", coarse_height=8, ocean_depth=0., white_metres=6250., device="cpu", refinement=.2, radius_metres=6371000., export_height=None):
     folder = Path(folder).expanduser().resolve()
     if (folder/"state").exists() or (folder/"planet-native.tif").exists():
         raise ValueError("This run already has output. Choose New run to preserve it.")
     if coarse_height < 4 or coarse_height % 4:
         raise ValueError("Resolution must use a coarse height divisible by four")
+    if not math.isfinite(radius_metres) or radius_metres <= 0:
+        raise ValueError("Radius metres must be positive and finite")
+    if export_height is not None and not 2 <= export_height <= coarse_height*256:
+        raise ValueError("Export height must be between 2 and coarse height × 256")
     if device not in ("cpu","cuda"):
         raise ValueError("Device must be cpu or cuda")
     resolved = resolve_seed(seed,folder/"checkpoints")
     cmd = [python_executable(),"-u","-m","planet_diffusion","generate",
            "--seed",str(resolved),"--state",str(folder/"state"),
            "--output",str(folder/"planet-native.tif"),"--checkpoint-dir",str(folder/"checkpoints"),
-           "--coarse-height",str(coarse_height),"--device",device,"--upstream",str(ROOT/"upstream")]
+           "--coarse-height",str(coarse_height),"--radius-metres",str(radius_metres),
+           "--device",device,"--upstream",str(ROOT/"upstream")]
+    if export_height is not None:
+        cmd += ["--height",str(export_height)]
     model = ROOT/"models"/"terrain-diffusion-90m"
     if model.is_dir():
         cmd += ["--model",str(model)]
@@ -74,10 +83,12 @@ class Launcher:
         self.draft = tk.StringVar()
         self.seed = tk.StringVar(value="random")
         self.folder = tk.StringVar()
-        self.resolution = tk.StringVar(value="8192 x 4096")
+        self.coarse_height = tk.StringVar(value="16")
+        self.export_resolution = tk.StringVar(value="8192 x 4096")
+        self.radius_metres = tk.StringVar(value="6371000")
         self.refinement = tk.StringVar(value="0.2")
         self.ocean = tk.StringVar(value="0")
-        self.white = tk.StringVar(value="4000")
+        self.white = tk.StringVar(value="6250")
         self.device = tk.StringVar(value="cpu")
         self.status = tk.StringVar(value="Choose a PNG draft, or leave it blank for a procedural planet.")
         ttk.Label(main,text="Generate a spherical elevation GeoTIFF",font=("Segoe UI",15)).grid(row=0,column=0,columnspan=3,sticky="w",pady=(0,12))
@@ -87,29 +98,31 @@ class Launcher:
         self.entry(main,4,"Run folder",self.folder,"Browse…",self.browse_folder)
         button = ttk.Button(main,text="New run",command=self.new_run)
         button.grid(row=5,column=2,sticky="e",pady=(0,8)); self.controls.append(button)
-        ttk.Label(main,text="Global resolution").grid(row=6,column=0,sticky="w")
-        resolution = ttk.Combobox(main,textvariable=self.resolution,state="readonly",
+        self.entry(main,6,"Coarse height (multiple of 4)",self.coarse_height)
+        self.entry(main,7,"Radius (metres)",self.radius_metres)
+        ttk.Label(main,text="Export resolution").grid(row=8,column=0,sticky="w")
+        resolution = ttk.Combobox(main,textvariable=self.export_resolution,state="readonly",
                                   values=["2048 x 1024","4096 x 2048","8192 x 4096","16384 x 8192"])
-        resolution.grid(row=6,column=1,sticky="ew",padx=8,pady=4); self.controls.append(resolution)
-        self.entry(main,7,"Ocean depth hint (0 = auto)",self.ocean)
-        self.entry(main,8,"White land elevation (m)",self.white)
-        self.entry(main,9,"Elevation refinement (0.01–4)",self.refinement)
-        ttk.Label(main,text="Default 0.2 · smaller values follow the draft more closely; larger values allow more change.").grid(row=10,column=0,columnspan=3,sticky="w",pady=(4,8))
-        ttk.Label(main,text="Compute device").grid(row=11,column=0,sticky="w")
+        resolution.grid(row=8,column=1,sticky="ew",padx=8,pady=4); self.controls.append(resolution)
+        self.entry(main,9,"Ocean depth hint (0 = auto)",self.ocean)
+        self.entry(main,10,"White land elevation (m)",self.white)
+        self.entry(main,11,"Elevation refinement (0.01–4)",self.refinement)
+        ttk.Label(main,text="Default 0.2 · smaller values follow the draft more closely; larger values allow more change.").grid(row=12,column=0,columnspan=3,sticky="w",pady=(4,8))
+        ttk.Label(main,text="Compute device").grid(row=13,column=0,sticky="w")
         device = ttk.Combobox(main,textvariable=self.device,values=["cpu","cuda"],state="readonly")
-        device.grid(row=11,column=1,sticky="ew",padx=8); self.controls.append(device)
-        ttk.Label(main,text="8k/16k CPU runs can take tens of minutes or longer. CUDA needs a CUDA-enabled PyTorch install.").grid(row=12,column=0,columnspan=3,sticky="w",pady=8)
+        device.grid(row=13,column=1,sticky="ew",padx=8); self.controls.append(device)
+        ttk.Label(main,text="Native height = coarse height × 256 pixels; export height cannot exceed it.").grid(row=14,column=0,columnspan=3,sticky="w",pady=8)
         actions = ttk.Frame(main)
-        actions.grid(row=13,column=0,columnspan=3,sticky="ew",pady=8)
+        actions.grid(row=15,column=0,columnspan=3,sticky="ew",pady=8)
         self.generate = ttk.Button(actions,text="Generate / Resume",command=self.start)
         self.generate.pack(side="left"); self.controls.append(self.generate)
         self.stop = ttk.Button(actions,text="Stop",command=self.cancel,state="disabled")
         self.stop.pack(side="left",padx=8)
         ttk.Button(actions,text="Open run folder",command=self.open_folder).pack(side="right")
-        ttk.Label(main,textvariable=self.status,wraplength=790).grid(row=14,column=0,columnspan=3,sticky="w",pady=6)
+        ttk.Label(main,textvariable=self.status,wraplength=790).grid(row=16,column=0,columnspan=3,sticky="w",pady=6)
         logframe = ttk.Frame(main)
-        logframe.grid(row=15,column=0,columnspan=3,sticky="nsew")
-        main.rowconfigure(15,weight=1)
+        logframe.grid(row=17,column=0,columnspan=3,sticky="nsew")
+        main.rowconfigure(17,weight=1)
         self.log = tk.Text(logframe,height=12,wrap="word",state="disabled")
         scroll = ttk.Scrollbar(logframe,command=self.log.yview)
         self.log.configure(yscrollcommand=scroll.set)
@@ -155,7 +168,9 @@ class Launcher:
             if not self.folder.get().strip():
                 raise ValueError("Choose a run folder")
             command,seed,folder = build_command(self.folder.get(),self.seed.get(),self.draft.get(),
-                int(self.resolution.get().split(" x ")[1])//256,float(self.ocean.get()),float(self.white.get()),self.device.get(),float(self.refinement.get()))
+                int(self.coarse_height.get()),float(self.ocean.get()),float(self.white.get()),self.device.get(),
+                float(self.refinement.get()),float(self.radius_metres.get()),
+                int(self.export_resolution.get().split(" x ")[1]))
             folder.mkdir(parents=True,exist_ok=True)
             self.seed.set(str(seed))
             self.append(f"\nSeed: {seed}\nRun folder: {folder}\n")
@@ -166,16 +181,23 @@ class Launcher:
         except (OSError,ValueError) as exc:
             messagebox.showerror("Cannot start generation",str(exc)); return
         self.stopping = False
+        started = time.perf_counter()
         self.busy(True)
         self.status.set(f"Generating with seed {seed}. Progress is saved for resuming.")
-        threading.Thread(target=self.read_worker,args=(self.process,folder),daemon=True).start()
+        threading.Thread(target=self.read_worker,args=(self.process,folder,started),daemon=True).start()
 
-    def read_worker(self,process,folder):
+    def read_worker(self,process,folder,started):
         try:
             with (folder/"generation.log").open("a",encoding="utf-8") as log:
                 for line in process.stdout:
                     log.write(line); log.flush(); self.events.put(("log",line))
             code = process.wait()
+            elapsed = time.perf_counter() - started
+            outcome = "Complete" if code == 0 else ("Stopped" if self.stopping else "Failed")
+            line = f"{outcome} in {elapsed:.1f} seconds.\n"
+            with (folder/"generation.log").open("a",encoding="utf-8") as log:
+                log.write(line)
+            self.events.put(("log",line))
             self.events.put(("done",code))
         except OSError as exc:
             self.events.put(("log",f"Log error: {exc}\n"))
