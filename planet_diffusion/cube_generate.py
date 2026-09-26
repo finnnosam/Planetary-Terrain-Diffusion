@@ -2,6 +2,7 @@
 import hashlib
 import copy
 import json
+import time
 from pathlib import Path
 import numpy as np
 from . import cube
@@ -9,9 +10,13 @@ from .cache import PredictionCache
 
 
 def generate_cube(backend, seed, face_coarse=4, coarse_steps=20, progress=print,
-                  audit=None, checkpoint_dir=None, draft=None):
+                  audit=None, checkpoint_dir=None, draft=None, region=None):
     if not 0 <= seed < 2**64 or face_coarse < 2 or face_coarse % 2 or coarse_steps < 2:
         raise ValueError("Require unsigned 64-bit seed, even face_coarse >= 2, coarse_steps >= 2")
+    if region is not None:
+        from .region import validate_region
+        bounds, width, height = region
+        bounds = validate_region(bounds, width, height, face_coarse*512)
     if draft is not None:
         backend = copy.copy(backend)
         backend.cond_snr = np.array([draft.refinement,.2,1.,.2,1.],np.float32)
@@ -20,6 +25,8 @@ def generate_cube(backend, seed, face_coarse=4, coarse_steps=20, progress=print,
         digest.update(Path(__file__).with_name(name).read_bytes())
     if draft is not None:
         digest.update(Path(__file__).with_name("draft.py").read_bytes())
+    if region is not None:
+        digest.update(Path(__file__).with_name("region.py").read_bytes())
     metadata = {**backend.metadata, "algorithm":"cubed-sphere-v3", "seed":seed,
                 "coarse_steps":coarse_steps, "coarse_height":2*face_coarse,
                 "face_coarse_intervals":face_coarse, "face_native_intervals":face_coarse*256,
@@ -29,6 +36,9 @@ def generate_cube(backend, seed, face_coarse=4, coarse_steps=20, progress=print,
                 "geometry":"six gnomonic charts; poles are regular face interiors",
                 "noise":"unit Gaussian per unique cube node; nearest-node model halos",
                 "source_sha256":digest.hexdigest()}
+    if region is not None:
+        metadata["algorithm"] = "cubed-sphere-regional-v1"
+        metadata["detail_noise"] = "cube-tile-seeded-v1"
     if draft is not None:
         metadata["draft"] = draft.metadata
         metadata["conditioning_noise"] = backend.cond_snr.tolist()
@@ -75,6 +85,7 @@ def generate_cube(backend, seed, face_coarse=4, coarse_steps=20, progress=print,
         return record(name,a)
 
     nc, nl, nd = face_coarse,face_coarse*32,face_coarse*256
+    guides_started = time.perf_counter()
     latent = restore("latent",5,nl)
     if latent is None:
         coarse = restore("coarse",6,nc)
@@ -109,6 +120,14 @@ def generate_cube(backend, seed, face_coarse=4, coarse_steps=20, progress=print,
             state = cube.identify(np.cos(t)*xt+np.sin(t)*pred)
             state = record(f"latent-{step}",state)
         latent = record("latent",state,save=True)
+
+    if region is not None:
+        from .region import generate_region
+        guide_seconds = time.perf_counter()-guides_started
+        progress(f"Regional detail: global guides ready in {guide_seconds:.1f}s; decoding requested cube patches and halos")
+        result, metadata = generate_region(backend,latent,seed,bounds,width,height,metadata,directory,progress)
+        metadata['regional_execution']['guide_seconds'] = guide_seconds
+        return result, metadata
 
     residual = restore("residual",1,nd)
     if residual is None:

@@ -19,17 +19,25 @@ class PredictionCache:
             temporary.write_text(json.dumps(identity, indent=2)+"\n")
             temporary.replace(manifest)
         self.predict = predict
+        self.hits = 0
+        self.misses = 0
 
     def __call__(self, a, *location):
+        return self.get_or_compute(lambda: a, (1, a.shape[-2], a.shape[-1]), *location)
+
+    def get_or_compute(self, make_input, shape, *location):
+        """Check disk before constructing expensive deterministic model inputs."""
         path = self.directory/("_".join(str(i) for i in location)+".npy")
         if path.exists():
             result = np.load(path, allow_pickle=False)
+            self.hits += 1
         else:
-            result = np.asarray(self.predict(a, *location), dtype=np.float32)
+            result = np.asarray(self.predict(make_input(), *location), dtype=np.float32)
+            self.misses += 1
             temporary = path.with_suffix(".npy.tmp")
             with temporary.open("wb") as handle:
                 np.save(handle, result, allow_pickle=False)
             temporary.replace(path)
-        if result.shape != (1, a.shape[-2], a.shape[-1]) or result.dtype != np.float32 or not np.isfinite(result).all():
+        if result.shape != shape or result.dtype != np.float32 or not np.isfinite(result).all():
             raise ValueError(f"Invalid decoder prediction at {path}")
         return result

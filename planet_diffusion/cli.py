@@ -8,7 +8,7 @@ from .storage import load_state, save_state, export_tiff, verify_state
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Generate spherical elevation with Terrain Diffusion")
     sub = parser.add_subparsers(dest="command", required=True)
-    gen = sub.add_parser("generate", help="Generate a global state and 2:1 GeoTIFF")
+    gen = sub.add_parser("generate", help="Generate a globe or regional spherical GeoTIFF")
     gen.add_argument("--state", required=True)
     gen.add_argument("--output", required=True)
     gen.add_argument("--seed", default="random", help="Unsigned integer, or random (default); printed and saved")
@@ -19,6 +19,9 @@ def main(argv=None):
     gen.add_argument("--coarse-height", type=int, default=8, help="Cube: multiple of 4; use >=8 for terrain, 4 for smoke tests")
     gen.add_argument("--coarse-steps", type=int, default=20)
     gen.add_argument("--height", type=int, help="Output pixel height; defaults to native height")
+    gen.add_argument("--bounds", nargs=4, type=float, metavar=("WEST","SOUTH","EAST","NORTH"),
+                     help="Regional degrees; east < west crosses the date line. Cube geometry only")
+    gen.add_argument("--width", type=int, help="Regional output width in pixels (requires --bounds and --height)")
     gen.add_argument("--radius-metres", type=float, default=6371000.)
     gen.add_argument("--backend", choices=["terrain", "diagnostic"], default="terrain")
     gen.add_argument("--geometry", choices=["cube", "equirectangular"], default="cube",
@@ -61,7 +64,16 @@ def main(argv=None):
                 raise ValueError("Cube geometry requires coarse-height divisible by 4 and >= 4")
             native = args.coarse_height*256
             height = args.height if args.height is not None else native
-            if not 2 <= height <= native:
+            region = None
+            if args.bounds is not None:
+                from .region import validate_region
+                if args.geometry != "cube" or args.width is None or args.height is None:
+                    raise ValueError("Regional generation requires cube geometry, --width and --height")
+                bounds = validate_region(args.bounds,args.width,args.height,native)
+                region = (args.bounds,args.width,args.height)
+            elif args.width is not None:
+                raise ValueError("--width requires --bounds")
+            elif not 2 <= height <= native:
                 raise ValueError("height must be between 2 and coarse-height*256")
             if args.threads < 1:
                 raise ValueError("threads must be positive")
@@ -73,7 +85,10 @@ def main(argv=None):
                 draft = Draft(args.draft,args.draft_ocean_depth,args.draft_white_metres,args.draft_refinement)
                 if args.coarse_height < 16:
                     print("Draft note: use coarse-height 16 or 32 for more recognizable global structure; each guide cell produces 256 output pixels.",file=sys.stderr)
-            print(f"Native state: {2*native} x {native}; export: {2*height} x {height}", file=sys.stderr)
+            if region:
+                print(f"Regional bounds: {bounds}; export: {args.width} x {height}; global guide height: {args.coarse_height}",file=sys.stderr)
+            else:
+                print(f"Native state: {2*native} x {native}; export: {2*height} x {height}", file=sys.stderr)
             print(f"Equatorial native spacing: {math.pi*args.radius_metres/native:.2f} m; scales with latitude", file=sys.stderr)
             if args.backend == "diagnostic":
                 backend = DiagnosticBackend()
@@ -85,7 +100,7 @@ def main(argv=None):
             if args.geometry == "cube":
                 from .cube_generate import generate_cube
                 a, metadata = generate_cube(backend,args.seed,args.coarse_height//2,args.coarse_steps,
-                    progress=progress,checkpoint_dir=checkpoint_dir,draft=draft)
+                    progress=progress,checkpoint_dir=checkpoint_dir,draft=draft,region=region)
             else:
                 a, metadata = generate(backend,args.seed,args.coarse_height,args.coarse_steps,
                     progress=progress,decoder_cache=args.checkpoint_dir)

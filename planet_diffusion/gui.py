@@ -34,7 +34,7 @@ def python_executable():
     return str(console if path.name.lower() == "pythonw.exe" and console.exists() else path)
 
 
-def build_command(folder, seed, draft="", coarse_height=8, ocean_depth=0., white_metres=6250., device="cpu", refinement=.2, radius_metres=6371000., export_height=None):
+def build_command(folder, seed, draft="", coarse_height=8, ocean_depth=0., white_metres=6250., device="cpu", refinement=.2, radius_metres=6371000., export_height=None, bounds=None, export_width=None):
     folder = Path(folder).expanduser().resolve()
     if (folder/"state").exists() or (folder/"planet-native.tif").exists():
         raise ValueError("This run already has output. Choose New run to preserve it.")
@@ -42,8 +42,13 @@ def build_command(folder, seed, draft="", coarse_height=8, ocean_depth=0., white
         raise ValueError("Resolution must use a coarse height divisible by four")
     if not math.isfinite(radius_metres) or radius_metres <= 0:
         raise ValueError("Radius metres must be positive and finite")
-    if export_height is not None and not 2 <= export_height <= coarse_height*256:
+    if bounds is not None:
+        from .region import validate_region
+        validate_region(bounds,export_width,export_height,coarse_height*256)
+    elif export_height is not None and not 2 <= export_height <= coarse_height*256:
         raise ValueError("Export height must be between 2 and coarse height × 256")
+    elif export_width is not None and export_width != 2*(export_height or coarse_height*256):
+        raise ValueError("Whole-globe output must have width = 2 × height")
     if device not in ("cpu","cuda"):
         raise ValueError("Device must be cpu or cuda")
     resolved = resolve_seed(seed,folder/"checkpoints")
@@ -54,6 +59,8 @@ def build_command(folder, seed, draft="", coarse_height=8, ocean_depth=0., white
            "--device",device,"--upstream",str(ROOT/"upstream")]
     if export_height is not None:
         cmd += ["--height",str(export_height)]
+    if bounds is not None:
+        cmd += ["--bounds",*[str(v) for v in bounds],"--width",str(export_width)]
     model = ROOT/"models"/"terrain-diffusion-90m"
     if model.is_dir():
         cmd += ["--model",str(model)]
@@ -74,8 +81,8 @@ class Launcher:
         self.stopping = False
         self.controls = []
         root.title("Planet Terrain Diffusion")
-        root.geometry("900x790")
-        root.minsize(740,610)
+        root.geometry("940x890")
+        root.minsize(850,800)
         root.protocol("WM_DELETE_WINDOW",self.close)
         main = ttk.Frame(root,padding=16)
         main.pack(fill="both",expand=True)
@@ -84,7 +91,10 @@ class Launcher:
         self.seed = tk.StringVar(value="random")
         self.folder = tk.StringVar()
         self.coarse_height = tk.StringVar(value="16")
-        self.export_resolution = tk.StringVar(value="8192 x 4096")
+        self.export_width = tk.StringVar(value="8192")
+        self.export_height = tk.StringVar(value="4096")
+        self.scope = tk.StringVar(value="Whole globe")
+        self.bounds = [tk.StringVar(value=v) for v in ("-30","-30","30","30")]
         self.radius_metres = tk.StringVar(value="6371000")
         self.refinement = tk.StringVar(value="0.2")
         self.ocean = tk.StringVar(value="0")
@@ -100,10 +110,13 @@ class Launcher:
         button.grid(row=5,column=2,sticky="e",pady=(0,8)); self.controls.append(button)
         self.entry(main,6,"Coarse height (multiple of 4)",self.coarse_height)
         self.entry(main,7,"Radius (metres)",self.radius_metres)
-        ttk.Label(main,text="Export resolution").grid(row=8,column=0,sticky="w")
-        resolution = ttk.Combobox(main,textvariable=self.export_resolution,state="readonly",
-                                  values=["2048 x 1024","4096 x 2048","8192 x 4096","16384 x 8192"])
-        resolution.grid(row=8,column=1,sticky="ew",padx=8,pady=4); self.controls.append(resolution)
+        ttk.Label(main,text="Output resolution (pixels)").grid(row=8,column=0,sticky="w")
+        resolution = ttk.Frame(main)
+        resolution.grid(row=8,column=1,sticky="ew",padx=8,pady=4)
+        for label,variable in (("Width",self.export_width),("Height",self.export_height)):
+            ttk.Label(resolution,text=label).pack(side="left",padx=(0,6))
+            widget = ttk.Entry(resolution,textvariable=variable,width=12)
+            widget.pack(side="left",padx=(0,12)); self.controls.append(widget)
         self.entry(main,9,"Ocean depth hint (0 = auto)",self.ocean)
         self.entry(main,10,"White land elevation (m)",self.white)
         self.entry(main,11,"Elevation refinement (0.01–4)",self.refinement)
@@ -111,18 +124,31 @@ class Launcher:
         ttk.Label(main,text="Compute device").grid(row=13,column=0,sticky="w")
         device = ttk.Combobox(main,textvariable=self.device,values=["cpu","cuda"],state="readonly")
         device.grid(row=13,column=1,sticky="ew",padx=8); self.controls.append(device)
-        ttk.Label(main,text="Native height = coarse height × 256 pixels; export height cannot exceed it.").grid(row=14,column=0,columnspan=3,sticky="w",pady=8)
+        ttk.Label(main,text="Coarse height sets global detail density. Regional pixel counts must fit that density.").grid(row=14,column=0,columnspan=3,sticky="w",pady=8)
+        ttk.Label(main,text="Generation area").grid(row=15,column=0,sticky="w")
+        scope = ttk.Combobox(main,textvariable=self.scope,values=["Whole globe","Region"],state="readonly")
+        scope.grid(row=15,column=1,sticky="ew",padx=8); self.controls.append(scope)
+        scope.bind("<<ComboboxSelected>>",self.change_scope)
+        ttk.Label(main,text="Regional bounds (degrees)").grid(row=16,column=0,sticky="w")
+        bounds = ttk.Frame(main)
+        bounds.grid(row=16,column=1,columnspan=2,sticky="ew",padx=8,pady=6)
+        self.bound_controls = []
+        for label,variable in zip(("West","South","East","North"),self.bounds):
+            ttk.Label(bounds,text=label).pack(side="left",padx=(0,4))
+            widget = ttk.Entry(bounds,textvariable=variable,width=7,state="disabled")
+            widget.pack(side="left",padx=(0,8)); self.controls.append(widget); self.bound_controls.append(widget)
+        ttk.Label(main,text="East < west crosses the date line. Latitude: −90 to 90. Drafts always cover the globe.").grid(row=17,column=0,columnspan=3,sticky="w",pady=(0,6))
         actions = ttk.Frame(main)
-        actions.grid(row=15,column=0,columnspan=3,sticky="ew",pady=8)
+        actions.grid(row=18,column=0,columnspan=3,sticky="ew",pady=8)
         self.generate = ttk.Button(actions,text="Generate / Resume",command=self.start)
         self.generate.pack(side="left"); self.controls.append(self.generate)
         self.stop = ttk.Button(actions,text="Stop",command=self.cancel,state="disabled")
         self.stop.pack(side="left",padx=8)
         ttk.Button(actions,text="Open run folder",command=self.open_folder).pack(side="right")
-        ttk.Label(main,textvariable=self.status,wraplength=790).grid(row=16,column=0,columnspan=3,sticky="w",pady=6)
+        ttk.Label(main,textvariable=self.status,wraplength=850).grid(row=19,column=0,columnspan=3,sticky="w",pady=6)
         logframe = ttk.Frame(main)
-        logframe.grid(row=17,column=0,columnspan=3,sticky="nsew")
-        main.rowconfigure(17,weight=1)
+        logframe.grid(row=20,column=0,columnspan=3,sticky="nsew")
+        main.rowconfigure(20,weight=1)
         self.log = tk.Text(logframe,height=12,wrap="word",state="disabled")
         scroll = ttk.Scrollbar(logframe,command=self.log.yview)
         self.log.configure(yscrollcommand=scroll.set)
@@ -162,6 +188,17 @@ class Launcher:
         for widget in self.controls:
             widget.configure(state="disabled" if value else ("readonly" if isinstance(widget,ttk.Combobox) else "normal"))
         self.stop.configure(state="normal" if value else "disabled")
+        if not value:
+            for widget in self.bound_controls:
+                widget.configure(state="normal" if self.scope.get() == "Region" else "disabled")
+
+    def change_scope(self,event=None):
+        regional = self.scope.get() == "Region"
+        for widget in self.bound_controls:
+            widget.configure(state="normal" if regional else "disabled")
+        coarse = int(self.coarse_height.get()) if self.coarse_height.get().isdigit() else 16
+        self.export_width.set("512" if regional else str(coarse*512))
+        self.export_height.set("512" if regional else str(coarse*256))
 
     def start(self):
         try:
@@ -170,7 +207,9 @@ class Launcher:
             command,seed,folder = build_command(self.folder.get(),self.seed.get(),self.draft.get(),
                 int(self.coarse_height.get()),float(self.ocean.get()),float(self.white.get()),self.device.get(),
                 float(self.refinement.get()),float(self.radius_metres.get()),
-                int(self.export_resolution.get().split(" x ")[1]))
+                int(self.export_height.get()),
+                bounds=[float(v.get()) for v in self.bounds] if self.scope.get() == "Region" else None,
+                export_width=int(self.export_width.get()))
             folder.mkdir(parents=True,exist_ok=True)
             self.seed.set(str(seed))
             self.append(f"\nSeed: {seed}\nRun folder: {folder}\n")

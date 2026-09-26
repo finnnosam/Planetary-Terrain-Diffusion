@@ -21,7 +21,9 @@ def load_state(path):
     metadata = json.loads((path/"planet.json").read_text(encoding="utf-8"))
     a = np.load(path/"elevation.npy", mmap_mode="r", allow_pickle=False)
     h = metadata["native_height"]
-    if a.shape != (h+1, 2*h) or a.dtype != np.float32:
+    shape = ((metadata["output_height"], metadata["output_width"])
+             if metadata.get("coverage") == "region" else (h+1, 2*h))
+    if a.shape != shape or a.dtype != np.float32:
         raise ValueError("State dimensions/dtype disagree with planet.json")
     return a, metadata
 
@@ -32,6 +34,10 @@ def export_tiff(path, a, metadata, height=None, window=None):
     Longitude windows may cross +180; their affine coordinates then exceed 180.
     This keeps one continuous GeoTIFF rather than mislabelling its bounds.
     """
+    if metadata.get("coverage") == "region":
+        if window is not None or height is not None and height != a.shape[0]:
+            raise ValueError("Regional states export at their saved bounds and resolution; generate another region for a different grid")
+        return export_region_tiff(path, a, metadata)
     import rasterio
     from rasterio.transform import from_origin
     from rasterio.windows import Window
@@ -72,6 +78,13 @@ def export_tiff(path, a, metadata, height=None, window=None):
 
 def verify_state(a, metadata):
     """Check saved-state integrity and actual limits at identified sphere points."""
+    if metadata.get("coverage") == "region":
+        digest = hashlib.sha256(np.asarray(a).tobytes()).hexdigest()
+        matches = digest == metadata["elevation_sha256"]
+        finite = bool(np.isfinite(a).all())
+        return {"passed":finite and matches, "sha256_matches":matches,
+                "finite":finite, "coverage":"region", "bounds":metadata["bounds"],
+                "note":"Regional integrity only; this state does not cover the whole globe"}
     h, w = a.shape[0]-1, a.shape[1]
     lon = np.linspace(0, w, 129)
     y = np.linspace(0, h, 129)
@@ -105,3 +118,25 @@ def verify_state(a, metadata):
             "polar_geometry": polar_anisotropy(a),
             "grid_artifact_warning": max(artifacts["row_phase_ratio"], artifacts["column_phase_ratio"]) > 1.15,
             "note": "Continuity checks, not a learned-terrain quality score or cross-device determinism guarantee"}
+
+
+def export_region_tiff(path, a, metadata):
+    import rasterio
+    from rasterio.transform import from_bounds
+    path = Path(path)
+    if path.exists():
+        raise FileExistsError(f"Refusing to overwrite {path}")
+    radius = float(metadata["radius_metres"])
+    if not np.isfinite(radius) or radius <= 0:
+        raise ValueError("radius must be positive and finite")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    rows, width = a.shape
+    crs = rasterio.crs.CRS.from_string(f"+proj=longlat +R={radius:.12g} +no_defs")
+    with rasterio.open(path,"w",driver="GTiff",width=width,height=rows,count=1,
+                       dtype="float32",crs=crs,transform=from_bounds(*metadata["bounds"],width,rows),
+                       compress="deflate",predictor=3,tiled=True,BIGTIFF="IF_SAFER",nodata=float("nan")) as dst:
+        dst.set_band_description(1,"Elevation above model sea level")
+        dst.set_band_unit(1,"m")
+        dst.update_tags(AREA_OR_POINT="Area", **{k:str(v) for k,v in metadata.items()},
+                        sampling="point evaluation at pixel centres; not area-averaged")
+        dst.write(a,1)

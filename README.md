@@ -2,9 +2,9 @@ https://github.com/xandergos/terrain-diffusion
 
 # Spherical Terrain Diffusion
 
-Generate a spherical elevation field with Xandergos's pretrained Terrain
-Diffusion models. Save the planet once, then export a 2:1 global GeoTIFF or
-smaller tiles. Generation runs on six connected cube faces. Longitude and
+Generate spherical elevation with Xandergos's pretrained Terrain Diffusion
+models. Generate a whole planet, or request a region without decoding the
+whole globe. Generation runs on six connected cube faces. Longitude and
 latitude are used for export.
 
 ## Install
@@ -52,6 +52,17 @@ click **Generate / Resume**. The default output is an 8192×4096 GeoTIFF.
 the same folder and settings. You can also launch with
 `.venv/Scripts/python -m planet_diffusion gui`.
 
+For regional generation, choose **Generation area → Region**, enter **West,
+South, East, North** in degrees, and set **Output resolution** width and height
+in pixels. East smaller than west crosses the date line (for example, west
+170 and east −170 covers 20 degrees). Polar regions are supported. Whole-globe
+output requires width = twice height; a region can have any aspect ratio.
+
+**Coarse height** still sets detail density on the sphere. The launcher reports
+the minimum coarse height if a region's requested pixel resolution exceeds
+that density. Larger coarse heights increase global guide work, even for a
+small region. Output dimensions do not change the sphere's radius or location.
+
 ### PNG draft convention
 
 Use a **2:1 global PNG** with north at the top. The left and right edges are
@@ -95,10 +106,37 @@ guide detail but increase compute and memory use. Checkpoints are saved in
 `STATE.checkpoints`; rerun with the same settings to resume. Completed outputs
 are protected from overwriting.
 
+### Generate only regional detail
+
+```powershell
+.venv/Scripts/python -m planet_diffusion generate --seed 42 --device cuda --coarse-height 16 --bounds 170 -10 -170 10 --width 256 --height 256 --model models/terrain-diffusion-90m --state outputs/region42 --output outputs/region42.tif
+```
+
+`--bounds WEST SOUTH EAST NORTH` requires `--width` and `--height`. Bounds are
+longitude/latitude degrees; dimensions are output pixels. The same global PNG
+draft convention applies. The small coarse and latent fields still cover the
+globe, while decoder patches and reconstruction halos are requested on demand.
+No full-resolution globe field is allocated or exported. Tiny regions still
+need overlapping model patches and surrounding context.
+
+Regional decoder noise is seeded by cube tile, so requests with the same seed,
+generation settings and aligned pixel centres agree regardless of bounds or
+query order. Regional detail uses a different noise layout from the legacy
+whole-globe path, so it is not an exact crop of that path. Global drafts and
+spherical topology are preserved. Regional checkpoints can be reused for other
+bounds/resolutions with the same generation settings and new state/output paths.
+
+Regional states store their exact bounds and pixel grid, and `export` reproduces
+that grid. They cannot export ungenerated areas or be used as full planet states.
+`verify` checks regional integrity and finite heights, without claiming global
+pole/date-line checks. Date-line-crossing TIFFs use continuous longitude bounds,
+such as 170° to 190°, on the same custom spherical CRS as global output.
+
 `--window X Y WIDTH HEIGHT` uses pixels in the selected global grid. Longitude
 wraps at the date line; latitude windows must stay within the globe. Tiles
-from the same saved state and resolution agree exactly. The full planet is
-generated before export; lower-resolution overviews may miss thin features.
+from the same saved global state and resolution agree exactly. This export-only
+option requires a previously generated whole planet; use `generate --bounds`
+to skip unneeded detail generation. Lower-resolution overviews may miss thin features.
 
 At the default radius, `coarse-height 8` gives about 9.8 km per output pixel
 at the equator, despite the model's 90 m training scale. Set
@@ -110,7 +148,7 @@ Oceans have generated seafloor elevations, not a flat water surface.
 
 - One float32 elevation band, **metres**, scale 1 and offset 0, signed around
   the model's sea-level zero. No 0–65535 normalization or height remapping.
-- North-up Plate Carrée longitude/latitude raster, global bounds
+- North-up Plate Carrée longitude/latitude raster. Whole-globe output has bounds
   `(-180, -90, 180, 90)`, exact 2:1 aspect ratio. Pixels sample cell centres;
   neither duplicate date-line columns nor duplicate pole rows are written.
 - A custom spherical geographic CRS with the requested radius; not WGS84.
@@ -120,7 +158,7 @@ Oceans have generated seafloor elevations, not a flat water surface.
   BigTIFF when needed, NaN nodata. Valid generated cells are finite.
 - GeoTIFF tags and `planet.json` record seed, model identity, source revision,
   algorithm, runtime versions, radius, resolution and units. `elevation.npy`
-  stores the native node field; its digest detects damage.
+  stores the native node field (or the requested regional pixel grid); its digest detects damage.
 - A date-line-crossing tile keeps a continuous affine longitude range (e.g.
   175° to 185°). Some GIS applications require splitting such tiles at 180°.
 
