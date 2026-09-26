@@ -1,3 +1,5 @@
+https://github.com/xandergos/terrain-diffusion
+
 # Spherical Terrain Diffusion
 
 Generate a spherical elevation field with Xandergos's pretrained Terrain
