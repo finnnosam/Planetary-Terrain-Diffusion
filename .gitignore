@@ -1,0 +1,51 @@
+# Local dependencies and downloads
+.venv/
+venv/
+env/
+upstream/
+models/
+*.egg-info/
+build/
+dist/
+.env
+.env.*
+
+# Generated planets, checkpoints, caches, and logs
+outputs/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.hypothesis/
+.coverage
+.coverage.*
+htmlcov/
+*.log
+*.tmp
+*.bak
+*.tif
+*.tiff
+*.npy
+*.npz
+*.h5
+*.hdf5
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+
+# Local examples, experiments, and verification material
+human_input/
+tests/
+scripts/
+docs/
+requirements-tested.txt
+
+# Local AI and editor state
+.agents/
+.codex/
+.idea/
+.vscode/
+*.swp
+*~
