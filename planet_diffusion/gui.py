@@ -34,10 +34,12 @@ def python_executable():
     return str(console if path.name.lower() == "pythonw.exe" and console.exists() else path)
 
 
-def build_command(folder, seed, draft="", coarse_height=8, ocean_depth=0., white_metres=6250., device="cpu", refinement=.2, radius_metres=6371000., export_height=None, bounds=None, export_width=None, latent_batch_size=1):
+def build_command(folder, seed, draft="", coarse_height=8, ocean_depth=0., white_metres=6250., device="cpu", refinement=.2, radius_metres=6371000., export_height=None, bounds=None, export_width=None, latent_batch_size=1, export_climate=False):
     folder = Path(folder).expanduser().resolve()
     if (folder/"state").exists() or (folder/"planet-native.tif").exists():
         raise ValueError("This run already has output. Choose New run to preserve it.")
+    if export_climate and (folder/"planet-climate.tif").exists():
+        raise ValueError("This run already has climate output. Choose New run to preserve it.")
     if coarse_height < 4 or coarse_height % 4:
         raise ValueError("Resolution must use a coarse height divisible by four")
     if not math.isfinite(radius_metres) or radius_metres <= 0:
@@ -60,6 +62,8 @@ def build_command(folder, seed, draft="", coarse_height=8, ocean_depth=0., white
            "--coarse-height",str(coarse_height),"--radius-metres",str(radius_metres),
            "--device",device,"--upstream",str(ROOT/"upstream"),
            "--latent-batch-size",str(latent_batch_size)]
+    if export_climate:
+        cmd += ["--climate-output",str(folder/"planet-climate.tif")]
     if export_height is not None:
         cmd += ["--height",str(export_height)]
     if bounds is not None:
@@ -104,12 +108,15 @@ class Launcher:
         self.white = tk.StringVar(value="6250")
         self.device = tk.StringVar(value="cpu")
         self.latent_batch_size = tk.StringVar(value="1")
+        self.export_climate = tk.BooleanVar(value=True)
         self.status = tk.StringVar(value="Choose a PNG draft, or leave it blank for a procedural planet.")
         ttk.Label(main,text="Generate a spherical elevation GeoTIFF",font=("Segoe UI",15)).grid(row=0,column=0,columnspan=3,sticky="w",pady=(0,12))
         self.entry(main,1,"Draft PNG (optional)",self.draft,"Browse…",self.browse_draft)
         ttk.Label(main,text="2:1 global map · north at top · black = ocean · lighter = higher land").grid(row=2,column=0,columnspan=3,sticky="w",pady=(0,12))
         self.entry(main,3,"Seed",self.seed,"Random",self.random_seed)
         self.entry(main,4,"Run folder",self.folder,"Browse…",self.browse_folder)
+        climate = ttk.Checkbutton(main,text="Export climate maps",variable=self.export_climate)
+        climate.grid(row=5,column=1,sticky="w",padx=8); self.controls.append(climate)
         button = ttk.Button(main,text="New run",command=self.new_run)
         button.grid(row=5,column=2,sticky="e",pady=(0,8)); self.controls.append(button)
         self.entry(main,6,"Coarse height (multiple of 4)",self.coarse_height)
@@ -213,7 +220,8 @@ class Launcher:
                 float(self.refinement.get()),float(self.radius_metres.get()),
                 int(self.export_height.get()),
                 bounds=[float(v.get()) for v in self.bounds] if self.scope.get() == "Region" else None,
-                export_width=int(self.export_width.get()),latent_batch_size=int(self.latent_batch_size.get()))
+                export_width=int(self.export_width.get()),latent_batch_size=int(self.latent_batch_size.get()),
+                export_climate=self.export_climate.get())
             folder.mkdir(parents=True,exist_ok=True)
             self.seed.set(str(seed))
             self.append(f"\nSeed: {seed}\nRun folder: {folder}\n")
@@ -257,7 +265,7 @@ class Launcher:
                 else:
                     self.process = None; self.busy(False)
                     self.status.set("Stopped. Use the same settings and folder to resume." if self.stopping else
-                        ("Complete: planet-native.tif is ready in the run folder." if value == 0 else
+                        ("Complete: exported GeoTIFFs are ready in the run folder." if value == 0 else
                          "Generation failed. See the log above; completed checkpoints were kept."))
         except queue.Empty:
             pass

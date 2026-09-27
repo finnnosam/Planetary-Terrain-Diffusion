@@ -2,7 +2,7 @@ import argparse
 import json
 import math
 import sys
-from .storage import load_state, save_state, export_tiff, verify_state
+from .storage import load_state, save_state, export_tiff, verify_state, load_climate
 
 
 def main(argv=None):
@@ -11,6 +11,7 @@ def main(argv=None):
     gen = sub.add_parser("generate", help="Generate a globe or regional spherical GeoTIFF")
     gen.add_argument("--state", required=True)
     gen.add_argument("--output", required=True)
+    gen.add_argument("--climate-output", help="Also export a five-band climate GeoTIFF (cube geometry)")
     gen.add_argument("--seed", default="random", help="Unsigned integer, or random (default); printed and saved")
     gen.add_argument("--draft", help="2:1 global PNG: black ocean, lighter shades higher land")
     gen.add_argument("--draft-ocean-depth", type=float, default=0., help="Ocean depth prior in metres; 0 = automatic learned bathymetry (default)")
@@ -38,6 +39,7 @@ def main(argv=None):
     tile = sub.add_parser("export", help="Export native-resolution tiles or another overview from saved state")
     tile.add_argument("--state", required=True)
     tile.add_argument("--output", required=True)
+    tile.add_argument("--climate-output", help="Also export saved climate on the same grid as elevation")
     tile.add_argument("--height", type=int, help="Global grid height; default is native resolution")
     tile.add_argument("--window", nargs=4, type=int, metavar=("X", "Y", "WIDTH", "HEIGHT"))
     check = sub.add_parser("verify", help="Check saved state's sphere topology and integrity")
@@ -48,6 +50,13 @@ def main(argv=None):
         if args.command == "gui":
             from .gui import main as gui_main
             return gui_main()
+        if args.command in ("generate","export"):
+            from pathlib import Path
+            if args.climate_output:
+                if Path(args.climate_output).resolve() in (Path(args.output).resolve(),Path(args.state).resolve()):
+                    raise ValueError("Climate output must differ from elevation output and state paths")
+                if Path(args.climate_output).exists():
+                    raise ValueError("Climate output path must not already exist")
         if args.command == "generate":
             from pathlib import Path
             from .backends import DiagnosticBackend, TerrainBackend
@@ -83,6 +92,8 @@ def main(argv=None):
                 raise ValueError("latent-batch-size must be positive")
             if args.geometry != "cube" and args.latent_batch_size != 1:
                 raise ValueError("latent-batch-size requires cube geometry")
+            if args.geometry != "cube" and args.climate_output:
+                raise ValueError("Climate output requires cube geometry")
             draft = None
             if args.draft:
                 if args.geometry != "cube":
@@ -103,27 +114,34 @@ def main(argv=None):
                 torch.set_num_threads(args.threads)
                 backend = TerrainBackend(args.upstream, args.model, args.revision, args.device)
             progress = lambda s: print(s, file=sys.stderr, flush=True)
+            climate = None
             if args.geometry == "cube":
                 from .cube_generate import generate_cube
-                a, metadata = generate_cube(backend,args.seed,args.coarse_height//2,args.coarse_steps,
+                a, metadata, climate = generate_cube(backend,args.seed,args.coarse_height//2,args.coarse_steps,
                     progress=progress,checkpoint_dir=checkpoint_dir,draft=draft,region=region,
-                    latent_batch_size=args.latent_batch_size)
+                    latent_batch_size=args.latent_batch_size,with_climate=True)
             else:
                 a, metadata = generate(backend,args.seed,args.coarse_height,args.coarse_steps,
                     progress=progress,decoder_cache=args.checkpoint_dir)
             metadata["radius_metres"] = args.radius_metres
-            save_state(args.state, a, metadata)
+            save_state(args.state, a, metadata, climate=climate)
             if draft is not None:
                 (Path(args.state)/"draft.png").write_bytes(draft.png_bytes)
             a, metadata = load_state(args.state)
             export_tiff(args.output, a, metadata, height)
+            if args.climate_output:
+                progress("Exporting five-band climate GeoTIFF")
+                export_tiff(args.climate_output,a,metadata,height,climate=climate)
             result = verify_state(a, metadata)
             print(json.dumps(result, indent=2))
             return 0 if result["passed"] else 1
         else:
             a, metadata = load_state(args.state)
             if args.command == "export":
+                climate = load_climate(args.state,metadata) if args.climate_output else None
                 export_tiff(args.output, a, metadata, args.height, args.window)
+                if args.climate_output:
+                    export_tiff(args.climate_output,a,metadata,args.height,args.window,climate=climate)
             else:
                 result = verify_state(a, metadata)
                 print(json.dumps(result, indent=2))

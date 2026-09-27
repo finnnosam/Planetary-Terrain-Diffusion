@@ -10,7 +10,9 @@ from .cache import PredictionCache
 
 
 def generate_cube(backend, seed, face_coarse=4, coarse_steps=20, progress=print,
-                  audit=None, checkpoint_dir=None, draft=None, region=None, latent_batch_size=1):
+                  audit=None, checkpoint_dir=None, draft=None, region=None, latent_batch_size=1,
+                  with_climate=False):
+    """Return elevation/metadata; with_climate adds compact climate features as a third result."""
     if (isinstance(latent_batch_size, bool) or not isinstance(latent_batch_size, (int, np.integer))
             or latent_batch_size < 1):
         raise ValueError("latent_batch_size must be a positive integer")
@@ -30,6 +32,8 @@ def generate_cube(backend, seed, face_coarse=4, coarse_steps=20, progress=print,
         digest.update(Path(__file__).with_name("draft.py").read_bytes())
     if region is not None:
         digest.update(Path(__file__).with_name("region.py").read_bytes())
+    if with_climate:
+        digest.update(Path(__file__).with_name("climate.py").read_bytes())
     metadata = {**backend.metadata, "algorithm":"cubed-sphere-v3", "seed":seed,
                 "coarse_steps":coarse_steps, "coarse_height":2*face_coarse,
                 "face_coarse_intervals":face_coarse, "face_native_intervals":face_coarse*256,
@@ -90,6 +94,7 @@ def generate_cube(backend, seed, face_coarse=4, coarse_steps=20, progress=print,
     nc, nl, nd = face_coarse,face_coarse*32,face_coarse*256
     guides_started = time.perf_counter()
     latent = restore("latent",5,nl)
+    coarse = None
     if latent is None:
         coarse = restore("coarse",6,nc)
         if coarse is None:
@@ -130,13 +135,23 @@ def generate_cube(backend, seed, face_coarse=4, coarse_steps=20, progress=print,
             state = record(f"latent-{step}",state)
         latent = record("latent",state,save=True)
 
+    climate = None
+    if with_climate:
+        from .climate import from_coarse
+        if coarse is None:
+            coarse = restore("coarse",6,nc)
+        if coarse is None:
+            raise ValueError("Climate reconstruction requires the coarse checkpoint; use a new checkpoint directory")
+        progress("Reconstructing elevation-adjusted climate features")
+        climate = record("climate-features",from_coarse(coarse))
+
     if region is not None:
         from .region import generate_region
         guide_seconds = time.perf_counter()-guides_started
         progress(f"Regional detail: global guides ready in {guide_seconds:.1f}s; decoding requested cube patches and halos")
         result, metadata = generate_region(backend,latent,seed,bounds,width,height,metadata,directory,progress)
         metadata['regional_execution']['guide_seconds'] = guide_seconds
-        return result, metadata
+        return (result, metadata, climate) if with_climate else (result, metadata)
 
     residual = restore("residual",1,nd)
     if residual is None:
@@ -157,4 +172,4 @@ def generate_cube(backend, seed, face_coarse=4, coarse_steps=20, progress=print,
     elevation = record("cube-elevation",np.sign(z)*z*z,save=True)
     progress("equirectangular export projection")
     projected = cube.to_equirectangular(elevation,nd*2)[0]
-    return projected,metadata
+    return (projected, metadata, climate) if with_climate else (projected, metadata)

@@ -106,6 +106,42 @@ Batching preserves patch order and overlap blending. Model floating-point
 results can vary slightly with batch size, so resume with the same setting.
 Existing checkpoints from before this code change require a new run folder.
 
+### Climate maps
+
+The launcher enables **Export climate maps** by default, producing
+`planet-climate.tif` alongside `planet-native.tif`. The climate TIFF has five
+float32 bands on exactly the same grid, bounds, and spherical CRS as elevation:
+
+| Band | Value | Unit |
+|---|---|---|
+| 1 | Temperature adjusted for generated elevation | degrees C |
+| 2 | Temperature standard deviation | degrees C |
+| 3 | Annual precipitation | mm |
+| 4 | Precipitation coefficient of variation | percent |
+| 5 | Temperature lapse rate | degrees C per metre |
+
+Climate patterns originate in the generated coarse map. Temperature receives
+additional detail from the final elevation using upstream's local land-weighted
+regression; underwater elevation is treated as sea level for this adjustment.
+Temperature variation is converted from upstream's internal hundredths of a
+degree. These are model climate estimates, not a weather simulation.
+
+The CLI accepts `--climate-output PATH` for both `generate` and `export`:
+
+```powershell
+.venv/Scripts/python -m planet_diffusion generate --seed 42 --device cuda --latent-batch-size 4 --model models/terrain-diffusion-90m --state outputs/climate-planet --output outputs/elevation.tif --climate-output outputs/climate.tif
+.venv/Scripts/python -m planet_diffusion export --state outputs/climate-planet --height 512 --output outputs/elevation-overview.tif --climate-output outputs/climate-overview.tif
+```
+
+New CLI cube runs always save compact, checksum-verified climate features in
+`state/climate.npy`, even if TIFF export is disabled. Later exports need no model
+inference. Global overviews, date-line-crossing tiles, and regional exports are
+supported; regional states retain their original bounds and resolution. Older
+elevation-only states remain readable but need regeneration to provide climate.
+Climate output is unavailable for the legacy equirectangular generator.
+
+### Elevation export
+
 ```powershell
 .venv/Scripts/python -m planet_diffusion generate --seed 42 --coarse-height 8 --model models/terrain-diffusion-90m --state outputs/planet42 --output outputs/planet42.tif
 .venv/Scripts/python -m planet_diffusion verify --state outputs/planet42

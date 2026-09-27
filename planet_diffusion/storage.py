@@ -5,13 +5,23 @@ import numpy as np
 from .topology import sample
 
 
-def save_state(path, elevation, metadata):
+def save_state(path, elevation, metadata, climate=None):
     path = Path(path)
     if path.exists():
         raise FileExistsError(f"Refusing to overwrite {path}")
+    metadata = dict(metadata)
+    if climate is not None:
+        from .climate import VERSION, BANDS
+        _validate_climate(climate,metadata)
+        metadata["climate"] = {"version":VERSION, "bands":[{"name":name,"unit":unit} for name,unit in BANDS],
+                               "sha256":hashlib.sha256(climate.tobytes()).hexdigest(),
+                               "source":"generated coarse climate; local land regression; cube interpolation"}
+    elif "climate" in metadata:
+        raise ValueError("Climate metadata requires climate features when saving")
     path.mkdir(parents=True)
     np.save(path/"elevation.npy", elevation.astype(np.float32))
-    metadata = dict(metadata)
+    if climate is not None:
+        np.save(path/"climate.npy",climate,allow_pickle=False)
     metadata["elevation_sha256"] = hashlib.sha256(elevation.astype(np.float32).tobytes()).hexdigest()
     (path/"planet.json").write_text(json.dumps(metadata, indent=2)+"\n", encoding="utf-8")
 
@@ -25,19 +35,51 @@ def load_state(path):
              if metadata.get("coverage") == "region" else (h+1, 2*h))
     if a.shape != shape or a.dtype != np.float32:
         raise ValueError("State dimensions/dtype disagree with planet.json")
+    if "climate" in metadata:
+        load_climate(path,metadata)
     return a, metadata
 
 
-def export_tiff(path, a, metadata, height=None, window=None):
+def _validate_climate(climate, metadata):
+    n = metadata.get("face_coarse_intervals",0)
+    if (n < 2 or climate.shape != (5,6,n+1,n+1) or climate.dtype != np.float32
+            or not np.isfinite(climate).all()):
+        raise ValueError("Invalid climate feature dimensions, dtype or values")
+
+
+def load_climate(path, metadata):
+    from .climate import VERSION
+    if "climate" not in metadata:
+        raise ValueError("This state has no saved climate; generate a new cube state to export climate")
+    if metadata["climate"].get("version") != VERSION:
+        raise ValueError("Unsupported saved climate version")
+    climate = np.load(Path(path)/"climate.npy",allow_pickle=False)
+    _validate_climate(climate,metadata)
+    if hashlib.sha256(climate.tobytes()).hexdigest() != metadata["climate"]["sha256"]:
+        raise ValueError("Saved climate checksum mismatch")
+    return climate
+
+
+def _describe_bands(dst, climate):
+    from .climate import BANDS
+    bands = BANDS if climate is not None else (("Elevation above model sea level","m"),)
+    for i,(name,unit) in enumerate(bands,1):
+        dst.set_band_description(i,name)
+        dst.set_band_unit(i,unit)
+
+
+def export_tiff(path, a, metadata, height=None, window=None, climate=None):
     """Window = (x, y, width, height) in the selected global pixel grid.
 
     Longitude windows may cross +180; their affine coordinates then exceed 180.
     This keeps one continuous GeoTIFF rather than mislabelling its bounds.
     """
+    if climate is not None:
+        _validate_climate(climate,metadata)
     if metadata.get("coverage") == "region":
         if window is not None or height is not None and height != a.shape[0]:
             raise ValueError("Regional states export at their saved bounds and resolution; generate another region for a different grid")
-        return export_region_tiff(path, a, metadata)
+        return export_region_tiff(path, a, metadata, climate=climate)
     import rasterio
     from rasterio.transform import from_origin
     from rasterio.windows import Window
@@ -59,21 +101,27 @@ def export_tiff(path, a, metadata, height=None, window=None):
     spacing = 180/height
     path.parent.mkdir(parents=True, exist_ok=True)
     with rasterio.open(path, "w", driver="GTiff", width=width, height=rows,
-                       count=1, dtype="float32", crs=crs,
+                       count=5 if climate is not None else 1, dtype="float32", crs=crs,
                        transform=from_origin(-180+x*spacing, 90-y*spacing, spacing, spacing),
                        compress="deflate", predictor=3, tiled=True, BIGTIFF="IF_SAFER",
                        nodata=float("nan")) as dst:
-        dst.set_band_description(1, "Elevation above model sea level")
-        dst.set_band_unit(1, "m")
+        _describe_bands(dst,climate)
         dst.update_tags(AREA_OR_POINT="Area", **{k: str(v) for k, v in metadata.items()},
                         export_global_height=str(height), window=json.dumps([x, y, width, rows]),
                         sampling="point evaluation at pixel centres; not area-averaged")
+        if climate is not None:
+            dst.update_tags(units="per-band",product="climate")
         for start in range(0, rows, 128):
             count = min(128, rows-start)
             yy = (y+np.arange(start, start+count)+.5)*h/height
             xx = (x+np.arange(width)+.5)*h/height
             values = sample(a, yy[:, None], xx[None, :]).astype(np.float32)
-            dst.write(values, 1, window=Window(0, start, width, count))
+            if climate is None:
+                dst.write(values, 1, window=Window(0, start, width, count))
+            else:
+                from .climate import evaluate
+                climate_values = evaluate(climate,-180+xx[None,:]*180/h,90-yy[:,None]*180/h,values)
+                dst.write(climate_values,window=Window(0,start,width,count))
 
 
 def verify_state(a, metadata):
@@ -120,9 +168,12 @@ def verify_state(a, metadata):
             "note": "Continuity checks, not a learned-terrain quality score or cross-device determinism guarantee"}
 
 
-def export_region_tiff(path, a, metadata):
+def export_region_tiff(path, a, metadata, climate=None):
     import rasterio
     from rasterio.transform import from_bounds
+    from rasterio.windows import Window
+    if climate is not None:
+        _validate_climate(climate,metadata)
     path = Path(path)
     if path.exists():
         raise FileExistsError(f"Refusing to overwrite {path}")
@@ -132,11 +183,21 @@ def export_region_tiff(path, a, metadata):
     path.parent.mkdir(parents=True, exist_ok=True)
     rows, width = a.shape
     crs = rasterio.crs.CRS.from_string(f"+proj=longlat +R={radius:.12g} +no_defs")
-    with rasterio.open(path,"w",driver="GTiff",width=width,height=rows,count=1,
+    with rasterio.open(path,"w",driver="GTiff",width=width,height=rows,count=5 if climate is not None else 1,
                        dtype="float32",crs=crs,transform=from_bounds(*metadata["bounds"],width,rows),
                        compress="deflate",predictor=3,tiled=True,BIGTIFF="IF_SAFER",nodata=float("nan")) as dst:
-        dst.set_band_description(1,"Elevation above model sea level")
-        dst.set_band_unit(1,"m")
+        _describe_bands(dst,climate)
         dst.update_tags(AREA_OR_POINT="Area", **{k:str(v) for k,v in metadata.items()},
                         sampling="point evaluation at pixel centres; not area-averaged")
-        dst.write(a,1)
+        if climate is None:
+            dst.write(a,1)
+        else:
+            from .climate import evaluate
+            dst.update_tags(units="per-band",product="climate")
+            west,south,east,north = metadata["bounds"]
+            lon = west+(np.arange(width)+.5)*(east-west)/width
+            for start in range(0,rows,128):
+                end = min(start+128,rows)
+                lat = north-(np.arange(start,end)+.5)*(north-south)/rows
+                dst.write(evaluate(climate,lon[None,:],lat[:,None],a[start:end]),
+                          window=Window(0,start,width,end-start))
