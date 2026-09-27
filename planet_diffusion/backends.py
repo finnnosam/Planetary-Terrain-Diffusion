@@ -158,7 +158,7 @@ class TerrainBackend:
         return result[0].cpu().numpy()
 
     def coarse_advance(self, prediction, state, step):
-        # One scheduler/history for the entire sphere, not one per patch.
+        # start_coarse resets history before each independent coarse tile.
         torch = self.torch
         with torch.inference_mode():
             return self.scheduler.step(torch.from_numpy(prediction.copy())[None],

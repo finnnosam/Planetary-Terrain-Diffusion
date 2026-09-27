@@ -8,6 +8,7 @@ import numpy as np
 from . import cube
 from .cache import PredictionCache
 from . import procedural
+from .coarse import sample_coarse, VERSION as COARSE_VERSION, TILE_SIZE, TILE_STRIDE
 
 
 def generate_cube(backend, seed, face_coarse=4, coarse_steps=20, progress=print,
@@ -31,7 +32,7 @@ def generate_cube(backend, seed, face_coarse=4, coarse_steps=20, progress=print,
         backend.cond_snr = (conditioning.cond_snr.copy() if conditioning is not None
                             else np.array([draft.refinement,.2,1.,.2,1.],np.float32))
     digest = hashlib.sha256()
-    for name in ("cube.py","cube_generate.py","backends.py","procedural.py"):
+    for name in ("cube.py","cube_generate.py","backends.py","procedural.py","coarse.py"):
         digest.update(Path(__file__).with_name(name).read_bytes())
     for name in ("synthetic_map_stats.json", "elevation_reference.npz"):
         digest.update((procedural.DATA/name).read_bytes())
@@ -62,6 +63,8 @@ def generate_cube(backend, seed, face_coarse=4, coarse_steps=20, progress=print,
         "version":"source-perlin-sphere-v1", "frequency_mult":list(frequency),
         "drop_water_pct":drop_water, "radius_coarse_cells":2*face_coarse/np.pi,
         "pyfastnoiselite":importlib.metadata.version("pyfastnoiselite")}
+    metadata["coarse_sampling"] = {"version":COARSE_VERSION, "tile_size":TILE_SIZE,
+                                   "tile_stride":TILE_STRIDE, "blend":"completed tiles; shared weighted sums"}
     if region is not None:
         metadata["algorithm"] = "cubed-sphere-regional-v1"
         metadata["detail_noise"] = "cube-tile-seeded-v1"
@@ -122,25 +125,10 @@ def generate_cube(backend, seed, face_coarse=4, coarse_steps=20, progress=print,
     if latent is None:
         coarse = restore("coarse",6,nc)
         if coarse is None:
-            channels = [0,2,3,4,5]
-            means, stds = backend.means,backend.stds
             options = dict(frequency_mult=frequency, drop_water_pct=drop_water)
             raw_guide = (cube.conditioning(seed,nc,**options) if source is None
                          else source.conditioning(seed,nc,**options))
-            record("raw-conditioning",raw_guide)
-            guide = (raw_guide-means[channels,None,None,None])/stds[channels,None,None,None]
-            angles = np.arctan(backend.cond_snr)[:,None,None,None]
-            guide = record("conditioning",(np.cos(angles)*guide+np.sin(angles)*cube.noise(seed,0,5,nc)).astype(np.float32))
-            state = record("coarse-noise",cube.noise(seed,1,6,nc)*backend.start_coarse(coarse_steps))
-            for step in range(coarse_steps):
-                progress(f"cube coarse {step+1}/{coarse_steps}")
-                def predict(a,f,y,x):
-                    cond = cube.read(guide,f,np.arange(y,y+16)[:,None],np.arange(x,x+16)[None,:],nearest=True)
-                    return backend.coarse_predict(a,cond,step)
-                pred = cube.consensus(state,predict,size=16,stride=8)
-                state = record(f"coarse-{step}",cube.identify(backend.coarse_advance(pred,state,step)))
-            coarse = backend.coarse_finish(state)*stds[:,None,None,None]+means[:,None,None,None]
-            coarse[1] = coarse[0]-coarse[1]
+            coarse = sample_coarse(backend,seed,raw_guide,coarse_steps,progress,record)
             coarse = record("coarse",cube.identify(coarse),save=True)
         state = np.zeros((5,6,nl+1,nl+1),np.float32)
         for step,t in enumerate([float(np.arctan(160)),float(np.arctan(.7))]):

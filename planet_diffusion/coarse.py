@@ -1,0 +1,51 @@
+"""WorldPipeline's completed-tile coarse sampling on shared spherical charts."""
+import numpy as np
+from . import cube
+
+TILE_SIZE = 64
+TILE_STRIDE = 48
+VERSION = "completed-coarse-tiles-v1"
+
+
+def linear_weight_window(size=TILE_SIZE):
+    # Exact upstream formula (including the epsilon throughout the ramp).
+    mid = (size-1)/2
+    w = 1-(1-1e-3)*np.clip(np.abs(np.arange(size,dtype=np.float32)-mid)/mid,0,1)
+    return w[:,None]*w[None,:]
+
+
+def sample_coarse(backend, seed, raw_guide, steps=20, progress=print, record=None):
+    """Denoise each tile independently, then combine physical channel values.
+
+    A fresh scheduler history per tile is established by start_coarse. Initial
+    and conditioning noise are shared per physical globe node and read nearest
+    across face boundaries, preserving the existing spherical RNG contract.
+    """
+    def emit(name, value):
+        return record(name,value) if record is not None else value
+    n = raw_guide.shape[-1]-1
+    channels = [0,2,3,4,5]
+    means, stds = backend.means, backend.stds
+    emit("raw-conditioning",raw_guide)
+    guide = (raw_guide-means[channels,None,None,None])/stds[channels,None,None,None]
+    angles = np.arctan(backend.cond_snr)[:,None,None,None]
+    guide = emit("conditioning",(np.cos(angles)*guide+np.sin(angles)*cube.noise(seed,0,5,n)).astype(np.float32))
+    initial = cube.noise(seed,1,6,n)
+    emit("coarse-noise",initial*backend.start_coarse(steps))
+    patches = 6*len(range(-TILE_STRIDE,n,TILE_STRIDE))**2
+    completed = 0
+    def predict(noise, face, y, x):
+        nonlocal completed
+        cond = cube.read(guide,face,np.arange(y,y+TILE_SIZE)[:,None],
+                         np.arange(x,x+TILE_SIZE)[None,:],nearest=True)
+        state = noise*backend.start_coarse(steps)
+        for step in range(steps):
+            prediction = backend.coarse_predict(state,cond,step)
+            state = backend.coarse_advance(prediction,state,step)
+        result = backend.coarse_finish(state)*stds[:,None,None]+means[:,None,None]
+        result[1] = result[0]-result[1]
+        completed += 1
+        progress(f"cube coarse tile {completed}/{patches} ({steps} steps)")
+        return result
+    return cube.consensus(initial,predict,size=TILE_SIZE,stride=TILE_STRIDE,
+                          weight_window=linear_weight_window(),shared_weights=True)

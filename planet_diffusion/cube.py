@@ -110,7 +110,8 @@ def conditioning(seed, n, frequency_mult=None, drop_water_pct=.5, raw=False):
     return values if raw else identify(procedural.encode(procedural.finalize(values)))
 
 
-def consensus(a, predict, size, stride, progress=None, batch_size=1, predict_batch=None):
+def consensus(a, predict, size, stride, progress=None, batch_size=1, predict_batch=None,
+              weight_window=None, shared_weights=False):
     """Blend in stable patch order, optionally evaluating bounded groups together."""
     if isinstance(batch_size, bool) or not isinstance(batch_size, (int, np.integer)) or batch_size < 1:
         raise ValueError("batch_size must be a positive integer")
@@ -118,6 +119,10 @@ def consensus(a, predict, size, stride, progress=None, batch_size=1, predict_bat
     positions = list(range(-stride,n,stride))
     w1 = np.maximum(1e-3, 1-np.abs(np.linspace(-1,1,size)))
     weight = w1[:,None]*w1[None,:]
+    if weight_window is not None:
+        weight = np.asarray(weight_window, dtype=np.float64)
+        if weight.shape != (size,size) or not np.isfinite(weight).all() or np.any(weight <= 0):
+            raise ValueError("Weight window must be finite, positive and match the patch size")
     norm = np.zeros((6,n+1,n+1),np.float64)
     total = None
     count, patches = 0, 6*len(positions)**2
@@ -151,6 +156,15 @@ def consensus(a, predict, size, stride, progress=None, batch_size=1, predict_bat
                 progress(count,patches)
     if np.any(norm == 0):
         raise RuntimeError("Incomplete cube prediction coverage")
+    if shared_weights:
+        # Duplicate face entries represent a single node. Combine their weighted
+        # numerators and denominators before dividing, not equal face averages.
+        members, ids, owners, _ = edge_groups(n)
+        for values in (total, norm[None]):
+            flat = values.reshape(values.shape[0], -1)
+            sums = np.zeros((values.shape[0],len(owners)),np.float64)
+            np.add.at(sums,(np.arange(values.shape[0])[:,None],ids[None,:]),flat[:,members])
+            flat[:,members] = sums[:,ids]
     return identify(total/norm)
 
 

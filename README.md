@@ -92,32 +92,27 @@ behavior over finalized procedural climate. Code, reference data, noise library
 version and procedural settings participate in checkpoint identity; previous
 checkpoints require a new run folder.
 
-### Procedural globe conditioning
+### Coarse tile sampling
 
-The cube sampler follows upstream `synthetic_map.py`: five independent Perlin
-FBm fields are quantile-matched to ETOPO elevation and WorldClim temperature,
-temperature variability, precipitation, and precipitation variability. It applies
-the source's precipitation-dependent lapse rate, temperature clipping and cold
-stretch, temperature variability regression, and precipitation variability damping.
-Elevation is then signed-square-root encoded; `WorldPipeline`'s channel ordering,
-normalization and conditioning-noise mixture are preserved.
+The coarse stage follows upstream `WorldPipeline`: 64 x 64 tiles at stride 48,
+20 denoising steps by default, and an independent scheduler history for each
+complete tile. It converts the six output channels back to physical units and
+reconstructs the elevation percentile channel before blending completed tiles
+with the source's linear weight window. `--coarse-steps` remains configurable.
 
-Noise is sampled in 3-D at shared sphere directions, using a radius of
-`2 * face_coarse / pi` coarse cells. This keeps its scale tied to model cells as
-the globe grows, with continuous fields across all edges and poles. The noise
-quantiles are calibrated in 3-D against a fixed population; individual faces and
-small planets are never independently histogram-matched. Small globes can therefore
-cover only a narrow part of the reference distributions. No latitude-based climate
-bands are imposed, matching the source's procedural approach.
+The spherical adaptation retains one Gaussian draw per physical globe node and
+nearest-node reads across faces. Shared edge and corner entries combine weighted
+sums before normalization. This preserves identical boundary values; it does not
+prove derivative continuity. On small globes, a 64-cell context exceeds a face,
+so the existing gnomonic halo projection stretches and repeats source nodes.
+There is no intermediate per-step consensus in the coarse stage. Latent and
+decoder sampling are unchanged. Start a new run folder for this sampler version.
 
-Model `frequency_mult` and `drop_water_pct` settings now control these fields.
-Reference statistics are bundled for offline generation; provenance and regeneration
-instructions are in `planet_diffusion/data/README.txt`. TIFF imports follow the
-source's import mode: merge raw channels, skip synthetic climate finalization, and
-encode elevation after blending. PNG drafts retain their existing elevation-overlay
-behavior over finalized procedural climate. Code, reference data, noise library
-version and procedural settings participate in checkpoint identity; previous
-checkpoints require a new run folder.
+For a reproducible pretrained coarse-only comparison of the old loop, a larger
+context with per-step blending, and completed-tile blending, install Matplotlib
+and run `python tools/compare_coarse.py --output outputs/coarse-comparison`.
+It saves arrays, area-weighted guide adherence metrics and comparison images.
+These coarse elevation proxies are not final decoded terrain.
 
 ### PNG draft convention
 
