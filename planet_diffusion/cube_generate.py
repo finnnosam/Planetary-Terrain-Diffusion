@@ -10,7 +10,10 @@ from .cache import PredictionCache
 
 
 def generate_cube(backend, seed, face_coarse=4, coarse_steps=20, progress=print,
-                  audit=None, checkpoint_dir=None, draft=None, region=None):
+                  audit=None, checkpoint_dir=None, draft=None, region=None, latent_batch_size=1):
+    if (isinstance(latent_batch_size, bool) or not isinstance(latent_batch_size, (int, np.integer))
+            or latent_batch_size < 1):
+        raise ValueError("latent_batch_size must be a positive integer")
     if not 0 <= seed < 2**64 or face_coarse < 2 or face_coarse % 2 or coarse_steps < 2:
         raise ValueError("Require unsigned 64-bit seed, even face_coarse >= 2, coarse_steps >= 2")
     if region is not None:
@@ -35,7 +38,7 @@ def generate_cube(backend, seed, face_coarse=4, coarse_steps=20, progress=print,
                 "grid":"generation: shared-node cubed sphere; export: equirectangular pixel centres",
                 "geometry":"six gnomonic charts; poles are regular face interiors",
                 "noise":"unit Gaussian per unique cube node; nearest-node model halos",
-                "source_sha256":digest.hexdigest()}
+                "source_sha256":digest.hexdigest(), "latent_batch_size":int(latent_batch_size)}
     if region is not None:
         metadata["algorithm"] = "cubed-sphere-regional-v1"
         metadata["detail_noise"] = "cube-tile-seeded-v1"
@@ -115,7 +118,13 @@ def generate_cube(backend, seed, face_coarse=4, coarse_steps=20, progress=print,
             def predict(a,f,y,x):
                 cond = cube.read(coarse,f,(y/32-1+np.arange(4))[:,None],(x/32-1+np.arange(4))[None,:])
                 return backend.predict("latent",a,cond,t)
+            def predict_batch(a,locations):
+                cond = np.stack([cube.read(coarse,f,(y/32-1+np.arange(4))[:,None],
+                                          (x/32-1+np.arange(4))[None,:]) for f,y,x in locations])
+                return backend.predict_batch("latent",a,cond,t)
             pred = cube.consensus(xt,predict,size=64,stride=32,
+                                  batch_size=latent_batch_size,
+                                  predict_batch=predict_batch if hasattr(backend,"predict_batch") else None,
                                   progress=lambda d,n:progress(f"cube latent {step+1}/2: {d}/{n} patches"))
             state = cube.identify(np.cos(t)*xt+np.sin(t)*pred)
             state = record(f"latent-{step}",state)

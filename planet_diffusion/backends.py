@@ -12,6 +12,25 @@ STDS = np.array([39.68515115440358, 3.0981253981231522, 8.940333096712806,
                  322.25238547630295, 856.3430083394657, 30.982620765341043], np.float32)
 
 
+def _limit_windows_cuda_memory(torch, device):
+    """Reject oversized cuDNN workspaces before WDDM spills into system RAM.
+
+    The deterministic convolution heuristic can request >14 GiB for just two
+    latent patches. An allocator limit makes cuDNN retry a smaller-workspace
+    algorithm. Leave headroom for Windows/display allocations and respect any
+    tighter allocator limit already set by the caller.
+    """
+    if sys.platform != "win32" or torch.device(device).type != "cuda":
+        return None
+    index = torch.device(device).index
+    if index is None:
+        index = torch.cuda.current_device()
+    get_fraction = getattr(torch.cuda, "get_per_process_memory_fraction", None)
+    fraction = min(.65, get_fraction(index) if get_fraction is not None else 1.)
+    torch.cuda.set_per_process_memory_fraction(fraction, index)
+    return fraction
+
+
 class DiagnosticBackend:
     """Fast deterministic stand-in for testing the spatial solver and file formats."""
     name = "diagnostic-NOT-TERRAIN-DIFFUSION"
@@ -41,6 +60,10 @@ class DiagnosticBackend:
             base[4] += float(cond[0].mean())/40
             return .25*base
         return .2*base[:1] + .1*cond[:1]
+
+    def predict_batch(self, stage, a, cond, t):
+        return np.stack([self.predict(stage, sample, guide, t)
+                         for sample, guide in zip(a, cond)])
 
 
 class TerrainBackend:
@@ -95,6 +118,7 @@ class TerrainBackend:
         torch.backends.cudnn.benchmark = False
         torch.backends.cuda.matmul.allow_tf32 = False
         torch.backends.cudnn.allow_tf32 = False
+        cuda_memory_fraction = _limit_windows_cuda_memory(torch, device)
         self.models = {}
         for stage, folder in [("coarse", "coarse_model"), ("latent", "base_model"), ("decoder", "decoder_model")]:
             self.models[stage] = EDMUnet2D.from_pretrained(
@@ -104,6 +128,7 @@ class TerrainBackend:
         self.metadata = {"backend": self.name, "model": model, "model_revision": resolved_revision,
                          "device": device, "torch": torch.__version__, "upstream_commit": UPSTREAM_COMMIT,
                          "torch_threads": torch.get_num_threads(),
+                         "cuda_memory_fraction": cuda_memory_fraction,
                          "python": sys.version.split()[0],
                          "diffusers": importlib.metadata.version("diffusers"),
                          "training_metres_per_pixel": config.get("native_resolution", 90.)}
@@ -138,19 +163,25 @@ class TerrainBackend:
         return state/.5
 
     def predict(self, stage, a, cond, t):
+        return self.predict_batch(stage, a[None], cond[None], t)[0]
+
+    def predict_batch(self, stage, a, cond, t):
+        """Evaluate B patches in one model call, including a short final batch."""
         torch = self.torch
+        batch = len(a)
         if stage == "latent":
-            raw = np.concatenate([cond, np.ones((1, 4, 4), np.float32)])
+            raw = np.concatenate([cond, np.ones((batch, 1, 4, 4), np.float32)], axis=1)
             means = np.array([14.99, 11.65, 15.87, 619.26, 833.12, 69.40, .66])
             stds = np.array([21.72, 21.78, 10.40, 452.29, 738.09, 34.59, .47])
-            c = self.tensor((raw-means[:, None, None])/stds[:, None, None])[None]
+            c = self.tensor((raw-means[None, :, None, None])/stds[None, :, None, None])
             inputs = [self.mp_concat([c[:, :1].flatten(1), c[:, 1:2].flatten(1),
                 c[:, 2:6, 1:3, 1:3].mean((2, 3)), c[:, 6:7].flatten(1),
-                self.tensor(self.histogram)[None], self.tensor([[-np.sqrt(3)]])], dim=1)]
-            model_input = self.tensor(a)[None]
+                self.tensor(self.histogram)[None].expand(batch,-1),
+                self.tensor(np.full((batch,1),-np.sqrt(3)))], dim=1)]
+            model_input = self.tensor(a)
         else:
-            model_input = self.tensor(np.concatenate([a, cond]))[None]
+            model_input = self.tensor(np.concatenate([a, cond], axis=1))
             inputs = []
         with torch.inference_mode():
-            result = self.models[stage](model_input, noise_labels=self.tensor([t]), conditional_inputs=inputs)
-        return result[0].cpu().numpy()
+            result = self.models[stage](model_input, noise_labels=self.tensor(np.full(batch,t)), conditional_inputs=inputs)
+        return result.cpu().numpy()

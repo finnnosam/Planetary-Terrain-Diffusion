@@ -18,6 +18,8 @@ def main(argv=None):
     gen.add_argument("--draft-refinement", type=float, default=.2, help="Upstream conditioning noise, 0.01..4; smaller follows guide more closely (default .2)")
     gen.add_argument("--coarse-height", type=int, default=8, help="Cube: multiple of 4; use >=8 for terrain, 4 for smoke tests")
     gen.add_argument("--coarse-steps", type=int, default=20)
+    gen.add_argument("--latent-batch-size", type=int, default=1,
+                     help="Cube latent patches per model call; larger batches use more memory (default: 1)")
     gen.add_argument("--height", type=int, help="Output pixel height; defaults to native height")
     gen.add_argument("--bounds", nargs=4, type=float, metavar=("WEST","SOUTH","EAST","NORTH"),
                      help="Regional degrees; east < west crosses the date line. Cube geometry only")
@@ -77,6 +79,10 @@ def main(argv=None):
                 raise ValueError("height must be between 2 and coarse-height*256")
             if args.threads < 1:
                 raise ValueError("threads must be positive")
+            if args.latent_batch_size < 1:
+                raise ValueError("latent-batch-size must be positive")
+            if args.geometry != "cube" and args.latent_batch_size != 1:
+                raise ValueError("latent-batch-size requires cube geometry")
             draft = None
             if args.draft:
                 if args.geometry != "cube":
@@ -100,7 +106,8 @@ def main(argv=None):
             if args.geometry == "cube":
                 from .cube_generate import generate_cube
                 a, metadata = generate_cube(backend,args.seed,args.coarse_height//2,args.coarse_steps,
-                    progress=progress,checkpoint_dir=checkpoint_dir,draft=draft,region=region)
+                    progress=progress,checkpoint_dir=checkpoint_dir,draft=draft,region=region,
+                    latent_batch_size=args.latent_batch_size)
             else:
                 a, metadata = generate(backend,args.seed,args.coarse_height,args.coarse_steps,
                     progress=progress,decoder_cache=args.checkpoint_dir)

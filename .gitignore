@@ -37,11 +37,10 @@ htmlcov/
 
 # Local examples, experiments, and verification material
 human_input/
-tests/*
-!tests/test_region.py
+todo_prompts_etc/
+tests/
 scripts/
-docs/*
-!docs/regional-generation.md
+docs/
 requirements-tested.txt
 
 # Local AI and editor state

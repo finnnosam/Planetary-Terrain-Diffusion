@@ -93,6 +93,19 @@ draft flags are `--draft-ocean-depth 0` and `--draft-white-metres 4000`.
 
 ## Generate and export
 
+Set **Latent batch size** in the launcher or pass `--latent-batch-size 2` to
+evaluate multiple latent patches per model call. This applies to whole-globe
+and regional cube generation. The default is `1`; increase cautiously because
+larger batches need more memory and can be slower on memory-limited GPUs.
+On Windows, CUDA allocation is limited to 65% of GPU memory (or an existing
+tighter limit). This prevents oversized cuDNN convolution workspaces from
+spilling into system RAM. On the tested 8 GB RTX 3070, batch sizes 4 and 8
+approximately halved latent model time after this fix; other generation stages
+are unaffected by latent batching. Start with 4 on that card.
+Batching preserves patch order and overlap blending. Model floating-point
+results can vary slightly with batch size, so resume with the same setting.
+Existing checkpoints from before this code change require a new run folder.
+
 ```powershell
 .venv/Scripts/python -m planet_diffusion generate --seed 42 --coarse-height 8 --model models/terrain-diffusion-90m --state outputs/planet42 --output outputs/planet42.tif
 .venv/Scripts/python -m planet_diffusion verify --state outputs/planet42

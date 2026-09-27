@@ -106,7 +106,10 @@ def conditioning(seed, n):
     return identify(np.stack(out,axis=1))
 
 
-def consensus(a, predict, size, stride, progress=None):
+def consensus(a, predict, size, stride, progress=None, batch_size=1, predict_batch=None):
+    """Blend in stable patch order, optionally evaluating bounded groups together."""
+    if isinstance(batch_size, bool) or not isinstance(batch_size, (int, np.integer)) or batch_size < 1:
+        raise ValueError("batch_size must be a positive integer")
     n = a.shape[-1]-1
     positions = list(range(-stride,n,stride))
     w1 = np.maximum(1e-3, 1-np.abs(np.linspace(-1,1,size)))
@@ -114,22 +117,34 @@ def consensus(a, predict, size, stride, progress=None):
     norm = np.zeros((6,n+1,n+1),np.float64)
     total = None
     count, patches = 0, 6*len(positions)**2
-    for f in range(6):
-        for y in positions:
-            for x in positions:
-                # Nearest shared-node reads preserve Gaussian innovation variance.
-                context = read(a,f,np.arange(y,y+size)[:,None],np.arange(x,x+size)[None,:],nearest=True)
-                pred = np.asarray(predict(context,f,y,x),dtype=np.float32)
-                if total is None:
-                    total = np.zeros((pred.shape[0],6,n+1,n+1),np.float64)
-                y0,y1,x0,x1 = max(0,y),min(n+1,y+size),max(0,x),min(n+1,x+size)
-                crop = (...,slice(y0-y,y1-y),slice(x0-x,x1-x))
-                weights = weight[crop[-2:]]
-                total[:,f,y0:y1,x0:x1] += pred[crop]*weights
-                norm[f,y0:y1,x0:x1] += weights
-                count += 1
-                if progress is not None and (count%16 == 0 or count == patches):
-                    progress(count,patches)
+    locations = [(f,y,x) for f in range(6) for y in positions for x in positions]
+    for start in range(0, patches, batch_size):
+        batch_locations = locations[start:start+batch_size]
+        contexts = []
+        for f,y,x in batch_locations:
+            # Nearest shared-node reads preserve Gaussian innovation variance.
+            context = read(a,f,np.arange(y,y+size)[:,None],np.arange(x,x+size)[None,:],nearest=True)
+            contexts.append(context)
+        if predict_batch is None:
+            predictions = np.stack([predict(context,*location)
+                                    for context,location in zip(contexts,batch_locations)])
+        else:
+            predictions = np.asarray(predict_batch(np.stack(contexts),batch_locations),dtype=np.float32)
+        if (predictions.ndim != 4 or predictions.shape[0] != len(batch_locations)
+                or predictions.shape[-2:] != (size,size) or not np.isfinite(predictions).all()):
+            raise ValueError("Invalid batched cube predictions")
+        for pred,(f,y,x) in zip(predictions,batch_locations):
+            pred = np.asarray(pred,dtype=np.float32)
+            if total is None:
+                total = np.zeros((pred.shape[0],6,n+1,n+1),np.float64)
+            y0,y1,x0,x1 = max(0,y),min(n+1,y+size),max(0,x),min(n+1,x+size)
+            crop = (...,slice(y0-y,y1-y),slice(x0-x,x1-x))
+            weights = weight[crop[-2:]]
+            total[:,f,y0:y1,x0:x1] += pred[crop]*weights
+            norm[f,y0:y1,x0:x1] += weights
+            count += 1
+            if progress is not None and (count%16 == 0 or count == patches):
+                progress(count,patches)
     if np.any(norm == 0):
         raise RuntimeError("Incomplete cube prediction coverage")
     return identify(total/norm)

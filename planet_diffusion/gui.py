@@ -34,7 +34,7 @@ def python_executable():
     return str(console if path.name.lower() == "pythonw.exe" and console.exists() else path)
 
 
-def build_command(folder, seed, draft="", coarse_height=8, ocean_depth=0., white_metres=6250., device="cpu", refinement=.2, radius_metres=6371000., export_height=None, bounds=None, export_width=None):
+def build_command(folder, seed, draft="", coarse_height=8, ocean_depth=0., white_metres=6250., device="cpu", refinement=.2, radius_metres=6371000., export_height=None, bounds=None, export_width=None, latent_batch_size=1):
     folder = Path(folder).expanduser().resolve()
     if (folder/"state").exists() or (folder/"planet-native.tif").exists():
         raise ValueError("This run already has output. Choose New run to preserve it.")
@@ -51,12 +51,15 @@ def build_command(folder, seed, draft="", coarse_height=8, ocean_depth=0., white
         raise ValueError("Whole-globe output must have width = 2 × height")
     if device not in ("cpu","cuda"):
         raise ValueError("Device must be cpu or cuda")
+    if isinstance(latent_batch_size,bool) or not isinstance(latent_batch_size,int) or latent_batch_size < 1:
+        raise ValueError("Latent batch size must be a positive integer")
     resolved = resolve_seed(seed,folder/"checkpoints")
     cmd = [python_executable(),"-u","-m","planet_diffusion","generate",
            "--seed",str(resolved),"--state",str(folder/"state"),
            "--output",str(folder/"planet-native.tif"),"--checkpoint-dir",str(folder/"checkpoints"),
            "--coarse-height",str(coarse_height),"--radius-metres",str(radius_metres),
-           "--device",device,"--upstream",str(ROOT/"upstream")]
+           "--device",device,"--upstream",str(ROOT/"upstream"),
+           "--latent-batch-size",str(latent_batch_size)]
     if export_height is not None:
         cmd += ["--height",str(export_height)]
     if bounds is not None:
@@ -100,6 +103,7 @@ class Launcher:
         self.ocean = tk.StringVar(value="0")
         self.white = tk.StringVar(value="6250")
         self.device = tk.StringVar(value="cpu")
+        self.latent_batch_size = tk.StringVar(value="1")
         self.status = tk.StringVar(value="Choose a PNG draft, or leave it blank for a procedural planet.")
         ttk.Label(main,text="Generate a spherical elevation GeoTIFF",font=("Segoe UI",15)).grid(row=0,column=0,columnspan=3,sticky="w",pady=(0,12))
         self.entry(main,1,"Draft PNG (optional)",self.draft,"Browse…",self.browse_draft)
@@ -124,7 +128,7 @@ class Launcher:
         ttk.Label(main,text="Compute device").grid(row=13,column=0,sticky="w")
         device = ttk.Combobox(main,textvariable=self.device,values=["cpu","cuda"],state="readonly")
         device.grid(row=13,column=1,sticky="ew",padx=8); self.controls.append(device)
-        ttk.Label(main,text="Coarse height sets global detail density. Regional pixel counts must fit that density.").grid(row=14,column=0,columnspan=3,sticky="w",pady=8)
+        self.entry(main,14,"Latent batch size (larger uses more memory)",self.latent_batch_size)
         ttk.Label(main,text="Generation area").grid(row=15,column=0,sticky="w")
         scope = ttk.Combobox(main,textvariable=self.scope,values=["Whole globe","Region"],state="readonly")
         scope.grid(row=15,column=1,sticky="ew",padx=8); self.controls.append(scope)
@@ -209,7 +213,7 @@ class Launcher:
                 float(self.refinement.get()),float(self.radius_metres.get()),
                 int(self.export_height.get()),
                 bounds=[float(v.get()) for v in self.bounds] if self.scope.get() == "Region" else None,
-                export_width=int(self.export_width.get()))
+                export_width=int(self.export_width.get()),latent_batch_size=int(self.latent_batch_size.get()))
             folder.mkdir(parents=True,exist_ok=True)
             self.seed.set(str(seed))
             self.append(f"\nSeed: {seed}\nRun folder: {folder}\n")
