@@ -70,18 +70,17 @@ class TiffConditioning:
                          "sampling":"8x8 area-weighted cube-node footprint; periodic longitude; shared poles",
                          "missing":"nodata and missing channels blend with seeded procedural guide"}
 
-    def conditioning(self, seed, n):
-        guide = cube.conditioning(seed,n)
+    def conditioning(self, seed, n, **options):
+        # WorldPipeline imports merge physical raw fields, skip synthetic
+        # climate finalization, and encode elevation only after blending.
+        from .procedural import encode
+        guide = cube.conditioning(seed,n,raw=True,**options)
         for channel, raster in self.rasters.items():
             values, coverage = raster.on_cube(n)
             procedural = guide[channel]
-            if channel == 0:
-                procedural = np.sign(procedural)*procedural**2
             blended = values+(1-np.clip(coverage,0,1))*procedural
-            if channel == 0:
-                blended = np.sign(blended)*np.sqrt(np.abs(blended))
             guide[channel] = blended
-        return cube.identify(guide)
+        return cube.identify(encode(guide))
 
     def snapshot(self, folder):
         folder = Path(folder)/"conditioning"

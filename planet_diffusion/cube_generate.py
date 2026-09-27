@@ -7,6 +7,7 @@ from pathlib import Path
 import numpy as np
 from . import cube
 from .cache import PredictionCache
+from . import procedural
 
 
 def generate_cube(backend, seed, face_coarse=4, coarse_steps=20, progress=print,
@@ -30,8 +31,13 @@ def generate_cube(backend, seed, face_coarse=4, coarse_steps=20, progress=print,
         backend.cond_snr = (conditioning.cond_snr.copy() if conditioning is not None
                             else np.array([draft.refinement,.2,1.,.2,1.],np.float32))
     digest = hashlib.sha256()
-    for name in ("cube.py","cube_generate.py","backends.py"):
+    for name in ("cube.py","cube_generate.py","backends.py","procedural.py"):
         digest.update(Path(__file__).with_name(name).read_bytes())
+    for name in ("synthetic_map_stats.json", "elevation_reference.npz"):
+        digest.update((procedural.DATA/name).read_bytes())
+    frequency, drop_water = procedural.validate(
+        getattr(backend, "frequency_mult", procedural.DEFAULT_FREQUENCY),
+        getattr(backend, "drop_water_pct", procedural.DEFAULT_DROP_WATER))
     if draft is not None:
         digest.update(Path(__file__).with_name("draft.py").read_bytes())
     if source is not None:
@@ -51,6 +57,11 @@ def generate_cube(backend, seed, face_coarse=4, coarse_steps=20, progress=print,
                 "geometry":"six gnomonic charts; poles are regular face interiors",
                 "noise":"unit Gaussian per unique cube node; nearest-node model halos",
                 "source_sha256":digest.hexdigest(), "latent_batch_size":int(latent_batch_size)}
+    import importlib.metadata
+    metadata["procedural_conditioning"] = {
+        "version":"source-perlin-sphere-v1", "frequency_mult":list(frequency),
+        "drop_water_pct":drop_water, "radius_coarse_cells":2*face_coarse/np.pi,
+        "pyfastnoiselite":importlib.metadata.version("pyfastnoiselite")}
     if region is not None:
         metadata["algorithm"] = "cubed-sphere-regional-v1"
         metadata["detail_noise"] = "cube-tile-seeded-v1"
@@ -113,7 +124,9 @@ def generate_cube(backend, seed, face_coarse=4, coarse_steps=20, progress=print,
         if coarse is None:
             channels = [0,2,3,4,5]
             means, stds = backend.means,backend.stds
-            raw_guide = cube.conditioning(seed,nc) if source is None else source.conditioning(seed,nc)
+            options = dict(frequency_mult=frequency, drop_water_pct=drop_water)
+            raw_guide = (cube.conditioning(seed,nc,**options) if source is None
+                         else source.conditioning(seed,nc,**options))
             record("raw-conditioning",raw_guide)
             guide = (raw_guide-means[channels,None,None,None])/stds[channels,None,None,None]
             angles = np.arctan(backend.cond_snr)[:,None,None,None]

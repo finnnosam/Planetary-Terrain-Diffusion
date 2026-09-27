@@ -7,7 +7,7 @@ name = "spherical-terrain-diffusion"
 version = "0.6.0"
 description = "Spherical sampling of Terrain Diffusion elevation models"
 requires-python = ">=3.11"
-dependencies = ["numpy>=1.26", "rasterio>=1.4", "Pillow>=10"]
+dependencies = ["numpy>=1.26", "rasterio>=1.4", "Pillow>=10", "pyfastnoiselite==0.0.7"]
 
 [project.optional-dependencies]
 models = ["torch>=2.4", "diffusers>=0.30", "safetensors>=0.4", "huggingface-hub>=0.25"]
@@ -21,6 +21,9 @@ planet-diffusion-gui = "planet_diffusion.gui:main"
 
 [tool.setuptools.packages.find]
 include = ["planet_diffusion*"]
+
+[tool.setuptools.package-data]
+planet_diffusion = ["data/*.json", "data/*.npz", "data/*.txt"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

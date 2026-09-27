@@ -38,6 +38,8 @@ class DiagnosticBackend:
     means, stds = MEANS, STDS
     cond_snr = np.array([.3, .1, 1., .1, 1.], np.float32)
     metadata = {"backend": name, "model_revision": "none"}
+    frequency_mult = (1.5, 3., 3., 3., 3.)
+    drop_water_pct = .5
 
     def start_coarse(self, steps):
         return 1.
@@ -112,6 +114,9 @@ class TerrainBackend:
         self.residual_mean = config.get("residual_mean", 0.)
         self.residual_std = config.get("residual_std", 1.1678)
         self.cond_snr = np.asarray(config.get("cond_snr") or [.3, .1, 1., .1, 1.], np.float32)
+        from .procedural import validate, DEFAULT_FREQUENCY
+        self.frequency_mult, self.drop_water_pct = validate(
+            config.get("frequency_mult") or DEFAULT_FREQUENCY, config.get("drop_water_pct", .5))
         self.histogram = np.asarray(config.get("histogram_raw") or [0.]*5, np.float32)
         self.torch, self.device, self.mp_concat = torch, device, mp_concat
         torch.use_deterministic_algorithms(True)

@@ -92,18 +92,22 @@ def noise(seed, stream, channels, n):
     return identify(rng.standard_normal((channels,6,n+1,n+1), dtype=np.float32), noise=True)
 
 
-def conditioning(seed, n):
+def conditioning(seed, n, frequency_mult=None, drop_water_pct=.5, raw=False):
+    """Source procedural channels sampled on one continuous 3-D sphere.
+
+    Radius gives n coarse cells per quarter great circle. Gnomonic chart
+    distortion remains, but neither face edges nor poles split the noise field.
+    Raw mode is for source-compatible imported conditioning before encoding.
+    """
+    from . import procedural
+    frequency = procedural.DEFAULT_FREQUENCY if frequency_mult is None else frequency_mult
     y, x = np.arange(n+1)[:,None], np.arange(n+1)[None,:]
-    rng = np.random.default_rng(np.random.SeedSequence([seed,910]))
-    k, phase = rng.normal(size=(12,3))*2, rng.uniform(0,2*np.pi,12)
     out = []
     for f in range(6):
         p = directions(f,y,x,n)
-        field = np.sin(p@k.T+phase).sum(-1)/np.sqrt(6)
-        elev = 2200*field-900
-        out.append(np.stack([np.sign(elev)*np.sqrt(np.abs(elev)), 28-48*p[...,2]**2,
-                             350+200*p[...,2]**2, 1200+400*np.tanh(field), 55+10*np.tanh(field)]))
-    return identify(np.stack(out,axis=1))
+        out.append(procedural.sample_raw(seed, p, 2*n/np.pi, frequency, drop_water_pct))
+    values = identify(np.stack(out,axis=1))
+    return values if raw else identify(procedural.encode(procedural.finalize(values)))
 
 
 def consensus(a, predict, size, stride, progress=None, batch_size=1, predict_batch=None):

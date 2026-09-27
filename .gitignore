@@ -28,6 +28,7 @@ htmlcov/
 *.tiff
 *.npy
 *.npz
+planet_diffusion/data
 *.h5
 *.hdf5
 *.pt
@@ -38,7 +39,9 @@ htmlcov/
 # Local examples, experiments, and verification material
 human_input/
 todo_prompts_etc/
-tests/
+tests/*
+!tests/test_procedural.py
+!tests/test_conditioning.py
 scripts/
 docs/
 requirements-tested.txt

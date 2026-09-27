@@ -60,8 +60,8 @@ class Draft(GlobalRaster):
                          "alpha":"transparent uses seeded procedural guide",
                          "sampling":"8x8 area-weighted cube-node footprint; periodic longitude; shared poles"}
 
-    def conditioning(self, seed, n):
-        guide = cube.conditioning(seed,n)
+    def conditioning(self, seed, n, **options):
+        guide = cube.conditioning(seed,n,**options)
         imported = self.on_cube(n)
         procedural = np.sign(guide[0])*guide[0]**2
         metres = imported[0]+(1-imported[1])*procedural

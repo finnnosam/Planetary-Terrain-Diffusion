@@ -25,6 +25,8 @@ Install each Python package:
 | NumPy | `.venv/Scripts/python -m pip install "numpy>=1.26"` |
 | Rasterio | `.venv/Scripts/python -m pip install "rasterio>=1.4"` |
 | Pillow | `.venv/Scripts/python -m pip install "Pillow>=10"` |
+| FastNoiseLite | `.venv/Scripts/python -m pip install "pyfastnoiselite==0.0.7"` |
+| FastNoiseLite | `.venv/Scripts/python -m pip install "pyfastnoiselite==0.0.7"` |
 | PyTorch | `.venv/Scripts/python -m pip install "torch>=2.4"` |
 | Diffusers | `.venv/Scripts/python -m pip install "diffusers>=0.30"` |
 | Safetensors | `.venv/Scripts/python -m pip install "safetensors>=0.4"` |
@@ -62,6 +64,60 @@ output requires width = twice height; a region can have any aspect ratio.
 the minimum coarse height if a region's requested pixel resolution exceeds
 that density. Larger coarse heights increase global guide work, even for a
 small region. Output dimensions do not change the sphere's radius or location.
+
+### Procedural globe conditioning
+
+The cube sampler follows upstream `synthetic_map.py`: five independent Perlin
+FBm fields are quantile-matched to ETOPO elevation and WorldClim temperature,
+temperature variability, precipitation, and precipitation variability. It applies
+the source's precipitation-dependent lapse rate, temperature clipping and cold
+stretch, temperature variability regression, and precipitation variability damping.
+Elevation is then signed-square-root encoded; `WorldPipeline`'s channel ordering,
+normalization and conditioning-noise mixture are preserved.
+
+Noise is sampled in 3-D at shared sphere directions, using a radius of
+`2 * face_coarse / pi` coarse cells. This keeps its scale tied to model cells as
+the globe grows, with continuous fields across all edges and poles. The noise
+quantiles are calibrated in 3-D against a fixed population; individual faces and
+small planets are never independently histogram-matched. Small globes can therefore
+cover only a narrow part of the reference distributions. No latitude-based climate
+bands are imposed, matching the source's procedural approach.
+
+Model `frequency_mult` and `drop_water_pct` settings now control these fields.
+Reference statistics are bundled for offline generation; provenance and regeneration
+instructions are in `planet_diffusion/data/README.txt`. TIFF imports follow the
+source's import mode: merge raw channels, skip synthetic climate finalization, and
+encode elevation after blending. PNG drafts retain their existing elevation-overlay
+behavior over finalized procedural climate. Code, reference data, noise library
+version and procedural settings participate in checkpoint identity; previous
+checkpoints require a new run folder.
+
+### Procedural globe conditioning
+
+The cube sampler follows upstream `synthetic_map.py`: five independent Perlin
+FBm fields are quantile-matched to ETOPO elevation and WorldClim temperature,
+temperature variability, precipitation, and precipitation variability. It applies
+the source's precipitation-dependent lapse rate, temperature clipping and cold
+stretch, temperature variability regression, and precipitation variability damping.
+Elevation is then signed-square-root encoded; `WorldPipeline`'s channel ordering,
+normalization and conditioning-noise mixture are preserved.
+
+Noise is sampled in 3-D at shared sphere directions, using a radius of
+`2 * face_coarse / pi` coarse cells. This keeps its scale tied to model cells as
+the globe grows, with continuous fields across all edges and poles. The noise
+quantiles are calibrated in 3-D against a fixed population; individual faces and
+small planets are never independently histogram-matched. Small globes can therefore
+cover only a narrow part of the reference distributions. No latitude-based climate
+bands are imposed, matching the source's procedural approach.
+
+Model `frequency_mult` and `drop_water_pct` settings now control these fields.
+Reference statistics are bundled for offline generation; provenance and regeneration
+instructions are in `planet_diffusion/data/README.txt`. TIFF imports follow the
+source's import mode: merge raw channels, skip synthetic climate finalization, and
+encode elevation after blending. PNG drafts retain their existing elevation-overlay
+behavior over finalized procedural climate. Code, reference data, noise library
+version and procedural settings participate in checkpoint identity; previous
+checkpoints require a new run folder.
 
 ### PNG draft convention
 
