@@ -34,7 +34,7 @@ def python_executable():
     return str(console if path.name.lower() == "pythonw.exe" and console.exists() else path)
 
 
-def build_command(folder, seed, draft="", coarse_height=8, ocean_depth=0., white_metres=6250., device="cpu", refinement=.2, radius_metres=6371000., export_height=None, bounds=None, export_width=None, latent_batch_size=1, export_climate=False, conditioning_dir="", conditioning_snr=".2,.2,1,.2,1"):
+def build_command(folder, seed, draft="", coarse_height=8, ocean_depth=0., white_metres=6250., device="cpu", refinement=.2, radius_metres=6371000., export_height=None, bounds=None, export_width=None, latent_batch_size=1, export_climate=False, conditioning_dir="", conditioning_snr=".2,.2,1,.2,1", regional_only=False):
     folder = Path(folder).expanduser().resolve()
     if (folder/"state").exists() or (folder/"planet-native.tif").exists():
         raise ValueError("This run already has output. Choose New run to preserve it.")
@@ -44,6 +44,8 @@ def build_command(folder, seed, draft="", coarse_height=8, ocean_depth=0., white
         raise ValueError("Resolution must use a coarse height divisible by four")
     if not math.isfinite(radius_metres) or radius_metres <= 0:
         raise ValueError("Radius metres must be positive and finite")
+    if regional_only and bounds is None:
+        raise ValueError("Regional-only guides require regional bounds")
     if bounds is not None:
         from .region import validate_region
         validate_region(bounds,export_width,export_height,coarse_height*256)
@@ -68,6 +70,8 @@ def build_command(folder, seed, draft="", coarse_height=8, ocean_depth=0., white
         cmd += ["--height",str(export_height)]
     if bounds is not None:
         cmd += ["--bounds",*[str(v) for v in bounds],"--width",str(export_width)]
+    if regional_only:
+        cmd += ["--regional-only"]
     model = ROOT/"models"/"terrain-diffusion-90m"
     if model.is_dir():
         cmd += ["--model",str(model)]
@@ -87,6 +91,35 @@ def build_command(folder, seed, draft="", coarse_height=8, ocean_depth=0., white
     return cmd,resolved,folder
 
 
+def build_query_command(folder, bounds, width, height, export_climate=False, stamp=None):
+    """Build a request for another region of a completed desktop or CLI run."""
+    from .query import load_query
+    from .region import validate_region
+
+    folder = Path(folder).expanduser().resolve()
+    if (folder/"state"/"planet.json").is_file():
+        state, output_folder = folder/"state", folder
+    elif (folder/"planet.json").is_file():
+        state, output_folder = folder, folder.parent
+    else:
+        raise ValueError("Choose a completed run folder or its state folder")
+    directory, _, metadata, _, _ = load_query(state, with_climate=export_climate)
+    validate_region(bounds,width,height,metadata["native_height"])
+    stamp = stamp or datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+    output = output_folder/(f"region-{stamp}.tif")
+    climate = output_folder/(f"region-{stamp}-climate.tif")
+    if output.exists() or export_climate and climate.exists():
+        raise ValueError("Query output already exists; choose a new output name")
+    command = [python_executable(),"-u","-m","planet_diffusion","query",
+               "--state",str(state),"--checkpoint-dir",str(directory),
+               "--bounds",*[str(value) for value in bounds],
+               "--width",str(width),"--height",str(height),
+               "--output",str(output),"--upstream",str(ROOT/"upstream")]
+    if export_climate:
+        command += ["--climate-output",str(climate)]
+    return command, output_folder, output
+
+
 class Launcher:
     def __init__(self, root):
         self.root = root
@@ -95,7 +128,7 @@ class Launcher:
         self.stopping = False
         self.controls = []
         root.title("Planet Terrain Diffusion")
-        root.geometry("940x950")
+        root.geometry("940x970")
         root.minsize(850,800)
         root.protocol("WM_DELETE_WINDOW",self.close)
         main = ttk.Frame(root,padding=16)
@@ -118,8 +151,9 @@ class Launcher:
         self.device = tk.StringVar(value="cpu")
         self.latent_batch_size = tk.StringVar(value="1")
         self.export_climate = tk.BooleanVar(value=True)
+        self.regional_only = tk.BooleanVar(value=True)
         self.status = tk.StringVar(value="Choose a PNG draft or TIFF folder, or leave both blank for a procedural planet.")
-        ttk.Label(main,text="Generate a spherical elevation GeoTIFF",font=("Segoe UI",15)).grid(row=0,column=0,columnspan=3,sticky="w",pady=(0,12))
+        ttk.Label(main,text="Generate or query spherical elevation",font=("Segoe UI",15)).grid(row=0,column=0,columnspan=3,sticky="w",pady=(0,12))
         self.entry(main,1,"Draft PNG (optional)",self.draft,"Browse…",self.browse_draft)
         ttk.Label(main,text="2:1 global map · north at top · black = ocean · lighter = higher land").grid(row=2,column=0,columnspan=3,sticky="w",pady=(0,12))
         self.entry(main,3,"Seed",self.seed,"Random",self.random_seed)
@@ -128,7 +162,7 @@ class Launcher:
         climate.grid(row=5,column=1,sticky="w",padx=8); self.controls.append(climate)
         button = ttk.Button(main,text="New run",command=self.new_run)
         button.grid(row=5,column=2,sticky="e",pady=(0,8)); self.controls.append(button)
-        self.entry(main,6,"Coarse height (multiple of 4)",self.coarse_height)
+        self.entry(main,6,"Logical guide height (multiple of 4)",self.coarse_height)
         self.entry(main,7,"Radius (metres)",self.radius_metres)
         ttk.Label(main,text="Output resolution (pixels)").grid(row=8,column=0,sticky="w")
         resolution = ttk.Frame(main)
@@ -145,8 +179,8 @@ class Launcher:
         device = ttk.Combobox(main,textvariable=self.device,values=["cpu","cuda"],state="readonly")
         device.grid(row=13,column=1,sticky="ew",padx=8); self.controls.append(device)
         self.entry(main,14,"Latent batch size (larger uses more memory)",self.latent_batch_size)
-        ttk.Label(main,text="Generation area").grid(row=15,column=0,sticky="w")
-        scope = ttk.Combobox(main,textvariable=self.scope,values=["Whole globe","Region"],state="readonly")
+        ttk.Label(main,text="Generation area / saved query").grid(row=15,column=0,sticky="w")
+        scope = ttk.Combobox(main,textvariable=self.scope,values=["Whole globe","Region","Saved run query"],state="readonly")
         scope.grid(row=15,column=1,sticky="ew",padx=8); self.controls.append(scope)
         scope.bind("<<ComboboxSelected>>",self.change_scope)
         ttk.Label(main,text="Regional bounds (degrees)").grid(row=16,column=0,sticky="w")
@@ -164,6 +198,9 @@ class Launcher:
         actions.grid(row=20,column=0,columnspan=3,sticky="ew",pady=8)
         self.generate = ttk.Button(actions,text="Generate / Resume",command=self.start)
         self.generate.pack(side="left"); self.controls.append(self.generate)
+        sparse = ttk.Checkbutton(actions,text="Only generate requested region",variable=self.regional_only,
+                                command=self.change_regional_mode)
+        sparse.pack(side="left",padx=8); self.controls.append(sparse)
         self.stop = ttk.Button(actions,text="Stop",command=self.cancel,state="disabled")
         self.stop.pack(side="left",padx=8)
         ttk.Button(actions,text="Open run folder",command=self.open_folder).pack(side="right")
@@ -196,7 +233,7 @@ class Launcher:
         if path: self.conditioning_dir.set(path)
 
     def browse_folder(self):
-        path = filedialog.askdirectory(title="Choose an empty run folder, or an interrupted run")
+        path = filedialog.askdirectory(title="Choose a run folder, including a completed run for queries")
         if path: self.folder.set(path)
 
     def new_run(self):
@@ -216,20 +253,48 @@ class Launcher:
         self.stop.configure(state="normal" if value else "disabled")
         if not value:
             for widget in self.bound_controls:
-                widget.configure(state="normal" if self.scope.get() == "Region" else "disabled")
+                widget.configure(state="normal" if self.scope.get() != "Whole globe" else "disabled")
 
     def change_scope(self,event=None):
-        regional = self.scope.get() == "Region"
+        regional = self.scope.get() != "Whole globe"
         for widget in self.bound_controls:
             widget.configure(state="normal" if regional else "disabled")
+        self.generate.configure(text="Query saved run" if self.scope.get() == "Saved run query" else "Generate / Resume")
+        if self.scope.get() == "Saved run query":
+            self.status.set("Choose a completed run folder, enter bounds and output resolution, then query its saved guides.")
+        elif self.scope.get() == "Region" and self.regional_only.get():
+            if self.coarse_height.get() == "16":
+                self.coarse_height.set("1024")
+            if [v.get() for v in self.bounds] == ["-30","-30","30","30"]:
+                for variable,value in zip(self.bounds,("-2","-2","2","2")):
+                    variable.set(value)
+            self.status.set("Sparse regional guides use a fixed global cell grid; only nearby model tiles are computed.")
+        elif self.coarse_height.get() == "1024":
+            self.coarse_height.set("16")
         coarse = int(self.coarse_height.get()) if self.coarse_height.get().isdigit() else 16
         self.export_width.set("512" if regional else str(coarse*512))
         self.export_height.set("512" if regional else str(coarse*256))
+
+    def change_regional_mode(self):
+        if self.scope.get() != "Region":
+            return
+        if self.regional_only.get() and self.coarse_height.get() == "16":
+            self.coarse_height.set("1024")
+        elif not self.regional_only.get() and self.coarse_height.get() == "1024":
+            self.coarse_height.set("16")
 
     def start(self):
         try:
             if not self.folder.get().strip():
                 raise ValueError("Choose a run folder")
+            if self.scope.get() == "Saved run query":
+                command,folder,output = build_query_command(
+                    self.folder.get(),[float(v.get()) for v in self.bounds],
+                    int(self.export_width.get()),int(self.export_height.get()),
+                    export_climate=self.export_climate.get())
+                self.append(f"\nQuerying saved run: {folder}\nOutput: {output}\n")
+                self._launch(command,folder,"query",f"query-{output.stem}.log")
+                return
             command,seed,folder = build_command(self.folder.get(),self.seed.get(),self.draft.get(),
                 int(self.coarse_height.get()),float(self.ocean.get()),float(self.white.get()),self.device.get(),
                 float(self.refinement.get()),float(self.radius_metres.get()),
@@ -238,32 +303,38 @@ class Launcher:
                 export_width=int(self.export_width.get()),latent_batch_size=int(self.latent_batch_size.get()),
                 export_climate=self.export_climate.get(),
                 conditioning_dir=self.conditioning_dir.get(),
-                conditioning_snr=self.refinement.get()+","+self.climate_refinement.get())
+                conditioning_snr=self.refinement.get()+","+self.climate_refinement.get(),
+                regional_only=self.regional_only.get() and self.scope.get() == "Region")
             folder.mkdir(parents=True,exist_ok=True)
             self.seed.set(str(seed))
             self.append(f"\nSeed: {seed}\nRun folder: {folder}\n")
             (folder/"launch.json").write_text(json.dumps({"seed":seed,"command":command},indent=2)+"\n")
-            self.process = subprocess.Popen(command,cwd=ROOT,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,
+            self._launch(command,folder,"generation","generation.log",seed=seed)
+        except (OSError,ValueError) as exc:
+            messagebox.showerror("Cannot start task",str(exc)); return
+
+    def _launch(self,command,folder,kind,log_name,seed=None):
+        self.process = subprocess.Popen(command,cwd=ROOT,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,
                 text=True,encoding="utf-8",errors="replace",creationflags=getattr(subprocess,"CREATE_NO_WINDOW",0),
                 env={**os.environ,"PYTHONIOENCODING":"utf-8"})
-        except (OSError,ValueError) as exc:
-            messagebox.showerror("Cannot start generation",str(exc)); return
         self.stopping = False
+        self.current_action = kind
         started = time.perf_counter()
         self.busy(True)
-        self.status.set(f"Generating with seed {seed}. Progress is saved for resuming.")
-        threading.Thread(target=self.read_worker,args=(self.process,folder,started),daemon=True).start()
+        self.status.set(f"Generating with seed {seed}. Progress is saved for resuming." if kind == "generation"
+                        else "Querying the saved run. Decoder predictions are cached for later requests.")
+        threading.Thread(target=self.read_worker,args=(self.process,folder/log_name,started),daemon=True).start()
 
-    def read_worker(self,process,folder,started):
+    def read_worker(self,process,log_path,started):
         try:
-            with (folder/"generation.log").open("a",encoding="utf-8") as log:
+            with log_path.open("a",encoding="utf-8") as log:
                 for line in process.stdout:
                     log.write(line); log.flush(); self.events.put(("log",line))
             code = process.wait()
             elapsed = time.perf_counter() - started
             outcome = "Complete" if code == 0 else ("Stopped" if self.stopping else "Failed")
             line = f"{outcome} in {elapsed:.1f} seconds.\n"
-            with (folder/"generation.log").open("a",encoding="utf-8") as log:
+            with log_path.open("a",encoding="utf-8") as log:
                 log.write(line)
             self.events.put(("log",line))
             self.events.put(("done",code))
@@ -281,9 +352,14 @@ class Launcher:
                 if kind == "log": self.append(value)
                 else:
                     self.process = None; self.busy(False)
-                    self.status.set("Stopped. Use the same settings and folder to resume." if self.stopping else
-                        ("Complete: exported GeoTIFFs are ready in the run folder." if value == 0 else
-                         "Generation failed. See the log above; completed checkpoints were kept."))
+                    if self.current_action == "query":
+                        self.status.set("Query stopped. Completed decoder predictions were kept." if self.stopping else
+                            ("Query complete: regional GeoTIFFs are ready in the run folder." if value == 0 else
+                             "Query failed. See the log above; completed predictions were kept."))
+                    else:
+                        self.status.set("Stopped. Use the same settings and folder to resume." if self.stopping else
+                            ("Complete: exported GeoTIFFs are ready in the run folder." if value == 0 else
+                             "Generation failed. See the log above; completed checkpoints were kept."))
         except queue.Empty:
             pass
         self.root.after(100,self.poll)
@@ -298,6 +374,8 @@ class Launcher:
         path = Path(self.folder.get())
         if not path.is_dir():
             messagebox.showinfo("Run folder","The folder will be created when generation starts."); return
+        if self.scope.get() == "Saved run query" and (path/"planet.json").is_file():
+            path = path.parent
         if os.name == "nt": os.startfile(path)
         else: subprocess.Popen(["open" if sys.platform == "darwin" else "xdg-open",str(path)])
 

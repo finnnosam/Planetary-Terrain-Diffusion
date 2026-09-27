@@ -284,6 +284,59 @@ are protected from overwriting.
 
 ### Generate only regional detail
 
+For genuinely regional model work, choose **Region** in the launcher and leave
+**Only generate requested region** checked. The launcher sets a logical guide
+height of 1024, equivalent to a 2048×1024 coarse placement grid. It allocates
+no full-grid coarse, latent, or native elevation array: fixed cube-face tile
+coordinates determine where cells may exist, and only tiles required by the
+requested area and model/filter halos are evaluated. With the default Earth
+radius, the 90 m model has about 76 m equatorial native spacing at this guide
+density. Smaller guide heights use wider physical model context.
+
+The CLI equivalent is:
+
+```powershell
+.venv/Scripts/python -m planet_diffusion generate --regional-only --bounds -2 -2 2 2 --width 512 --height 512 --state outputs/local/state --output outputs/local/region.tif --climate-output outputs/local/climate.tif
+```
+
+`--regional-only` requires bounds. Its default logical guide height is 1024;
+`--coarse-height` can override it for another fixed grid density. Sparse runs
+keep stage tiles in the checkpoint directory, and **Saved run query** can extend
+the same world to another region without generating earlier areas. Existing
+dense runs keep their original checkpoint format. The fixed 64-cell coarse
+model context and additional stage halos may reach well outside the requested
+rectangle. At guide height 1024 this coarse context is roughly 1,250 km near
+the equator on an Earth-sized globe. Conditioning PNGs and TIFFs are loaded as
+source files, while only their requested coarse-node footprints are sampled.
+
+Sparse climate is recomputed on demand for `generate --climate-output` or
+`query --climate-output`; it is not stored as a dense climate field in the
+regional state. Use `query` to export climate again or over another region.
+
+After completing any cube run, use `query` to request further regions from its
+saved coarse and latent guides. The command decodes only the needed detail
+patches and keeps their predictions in the original checkpoint directory, so
+overlapping or repeated queries reuse them. For a CLI run, the checkpoint
+directory is normally `STATE.checkpoints`; for a desktop run it is the sibling
+`checkpoints/` folder. Pass `--checkpoint-dir` if neither location is unique.
+
+In the desktop launcher, browse to a completed **Run folder** (or its `state`
+folder), choose **Generation area → Saved run query**, enter regional bounds and
+output width/height, then click **Query saved run**. Each query writes a new,
+timestamped regional TIFF in the run folder. **Export climate maps** also writes
+a climate TIFF when the saved state contains climate features. Stop preserves
+completed decoder predictions for the next query.
+
+```powershell
+.venv/Scripts/python -m planet_diffusion query --state outputs/my-planet/state --bounds 170 -10 -170 10 --width 256 --height 256 --output outputs/second-region.tif --climate-output outputs/second-region-climate.tif
+```
+
+`--climate-output` requires climate saved with the original state. A query
+preserves the original seed, model, native density, sphere radius and input
+guides; it refuses a mismatched checkpoint or changed generation code. Querying
+a whole-globe state uses the regional decoder's tile-seeded detail field, so
+its pixels are not guaranteed to equal an earlier whole-globe export.
+
 ```powershell
 .venv/Scripts/python -m planet_diffusion generate --seed 42 --device cuda --coarse-height 16 --bounds 170 -10 -170 10 --width 256 --height 256 --model models/terrain-diffusion-90m --state outputs/region42 --output outputs/region42.tif
 ```

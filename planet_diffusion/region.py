@@ -1,7 +1,8 @@
 """On-demand cube detail, with spherical halos and bounded in-memory tile caches.
 
-Like upstream WorldPipeline, queries pull overlapping decoder patches. The
-coarse and latent sphere remain global; native detail is never allocated globally.
+Like upstream WorldPipeline, queries pull overlapping decoder patches. Dense
+generation can provide global coarse and latent guides; sparse generation
+supplies the same interface with guides evaluated only on demand.
 """
 from functools import lru_cache
 import math
@@ -177,10 +178,13 @@ def filtered(field, weights, axis, output_n=None):
 
 
 def reconstruct(residual, lowfreq):
-    n, nl = residual.n, lowfreq.shape[-1]-1
+    n, nl = residual.n, (lowfreq.n if hasattr(lowfreq,"read") else lowfreq.shape[-1]-1)
     scale = n//nl
+    def low_read(f,y,x):
+        return (lowfreq.read(f,y,x) if hasattr(lowfreq,"read") else
+                cube.read(lowfreq,f,y,x)[0])
     provisional = Field(n, lambda f,y,x: residual.read(f,y,x)
-                        + cube.read(lowfreq,f,y/scale,x/scale)[0])
+                        + low_read(f,y/scale,x/scale))
     offsets = np.arange(1-scale, scale)
     weights = (1-np.abs(offsets)/scale)/scale
     reduced = filtered(filtered(provisional, weights, 1), weights, 0, nl)
@@ -209,8 +213,10 @@ def generate_region(backend, latent, seed, bounds, width, height, metadata, dire
         return prediction
     if directory is not None:
         import hashlib
+        latent_identity = (latent.identity if hasattr(latent,"identity") else
+                           hashlib.sha256(latent.tobytes()).hexdigest())
         predict = PredictionCache(directory/'regional-decoder',
-            {'generation':metadata, 'latent_sha256':hashlib.sha256(latent.tobytes()).hexdigest()}, predict)
+            {'generation':metadata, 'latent_sha256':latent_identity}, predict)
 
     @lru_cache(maxsize=64)
     def patch(f, y, x):
@@ -247,7 +253,11 @@ def generate_region(backend, latent, seed, bounds, width, height, metadata, dire
         value = np.cos(t)*np.sin(t)*noise.read(f,y,x)*norm+np.sin(t)*total
         return value*backend.residual_std+backend.residual_mean*norm, norm
 
-    elevation = reconstruct(Field(n, residual_raw,weighted=True), latent[4:5]*38.6-31.4)
+    if hasattr(latent,"channel"):
+        lowfreq = Field(latent.n,lambda f,y,x:latent.channel(4).read(f,y,x)*38.6-31.4)
+    else:
+        lowfreq = latent[4:5]*38.6-31.4
+    elevation = reconstruct(Field(n, residual_raw,weighted=True), lowfreq)
     # Square nodes before interpolation, as in the global generator.
     square = Field(n, lambda f,y,x: np.sign(z := elevation.read(f,y,x))*z*z)
     west, south, east, north = bounds

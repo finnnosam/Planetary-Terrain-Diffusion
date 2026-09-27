@@ -68,3 +68,14 @@ class Draft(GlobalRaster):
         guide[0] = np.sign(metres)*np.sqrt(np.abs(metres))
         return cube.identify(guide)
 
+    def conditioning_nodes(self, seed, face, y, x, n, **options):
+        from . import procedural
+        p = cube.directions(face,y,x,n)
+        guide = procedural.encode(procedural.finalize(
+            procedural.sample_raw(seed,p,2*n/np.pi,**options)))
+        imported = self.on_cube_nodes(face,y,x,n)
+        procedural_elev = np.sign(guide[0])*guide[0]**2
+        metres = imported[0]+(1-imported[1])*procedural_elev
+        guide[0] = np.sign(metres)*np.sqrt(np.abs(metres))
+        return guide
+

@@ -74,7 +74,7 @@ def export_tiff(path, a, metadata, height=None, window=None, climate=None):
     Longitude windows may cross +180; their affine coordinates then exceed 180.
     This keeps one continuous GeoTIFF rather than mislabelling its bounds.
     """
-    if climate is not None:
+    if climate is not None and not hasattr(climate,"sample"):
         _validate_climate(climate,metadata)
     if metadata.get("coverage") == "region":
         if window is not None or height is not None and height != a.shape[0]:
@@ -172,7 +172,7 @@ def export_region_tiff(path, a, metadata, climate=None):
     import rasterio
     from rasterio.transform import from_bounds
     from rasterio.windows import Window
-    if climate is not None:
+    if climate is not None and not hasattr(climate,"sample"):
         _validate_climate(climate,metadata)
     path = Path(path)
     if path.exists():

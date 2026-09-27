@@ -17,8 +17,10 @@ def decoder_conditioning(latent, face, y, x, size=DECODER_SIZE):
     """
     if y % COMPRESSION or x % COMPRESSION or size % COMPRESSION:
         raise ValueError("Decoder tile coordinates and size must align to latent compression")
-    cond = cube.read(latent[:4],face,(y//COMPRESSION+np.arange(size//COMPRESSION))[:,None],
-                     (x//COMPRESSION+np.arange(size//COMPRESSION))[None,:],nearest=True)
+    yy = (y//COMPRESSION+np.arange(size//COMPRESSION))[:,None]
+    xx = (x//COMPRESSION+np.arange(size//COMPRESSION))[None,:]
+    cond = (latent.read(face,yy,xx,nearest=True)[:4] if hasattr(latent,"read") else
+            cube.read(latent[:4],face,yy,xx,nearest=True))
     return np.repeat(np.repeat(cond,COMPRESSION,-2),COMPRESSION,-1)
 
 

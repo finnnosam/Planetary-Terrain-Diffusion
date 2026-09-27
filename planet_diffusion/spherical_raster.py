@@ -32,3 +32,17 @@ class GlobalRaster:
         self._samples[n] = imported
         return imported
 
+    def on_cube_nodes(self, face, y, x, n):
+        """Evaluate only requested coarse-node footprints on one cube chart."""
+        y, x = np.broadcast_arrays(y, x)
+        total = np.zeros((self.nodes.shape[0],) + y.shape, np.float64)
+        weight_sum = np.zeros(y.shape, np.float64)
+        offsets = (np.arange(8)+.5)/8-.5
+        for dy in offsets:
+            for dx in offsets:
+                p = cube.directions(face,y+dy,x+dx,n,normalize=False)
+                weight = np.linalg.norm(p,axis=-1)**-3
+                total += self.evaluate(p)*weight
+                weight_sum += weight
+        return (total/weight_sum).astype(np.float32)
+

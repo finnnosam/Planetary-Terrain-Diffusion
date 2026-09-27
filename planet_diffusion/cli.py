@@ -19,7 +19,8 @@ def main(argv=None):
     gen.add_argument("--draft-ocean-depth", type=float, default=0., help="Ocean depth prior in metres; 0 = automatic learned bathymetry (default)")
     gen.add_argument("--draft-white-metres", type=float, default=4000., help="Elevation assigned to white (default 4000 m)")
     gen.add_argument("--draft-refinement", type=float, default=.2, help="Upstream conditioning noise, 0.01..4; smaller follows guide more closely (default .2)")
-    gen.add_argument("--coarse-height", type=int, default=8, help="Cube: multiple of 4; use >=8 for terrain, 4 for smoke tests")
+    gen.add_argument("--coarse-height", type=int, help="Logical guide height, multiple of 4; default 8 dense or 1024 regional-only")
+    gen.add_argument("--regional-only", action="store_true", help="Use sparse fixed-grid guides; requires --bounds")
     gen.add_argument("--coarse-steps", type=int, default=20)
     gen.add_argument("--latent-batch-size", type=int, default=1,
                      help="Cube latent patches per model call; larger batches use more memory (default: 1)")
@@ -44,6 +45,15 @@ def main(argv=None):
     tile.add_argument("--climate-output", help="Also export saved climate on the same grid as elevation")
     tile.add_argument("--height", type=int, help="Global grid height; default is native resolution")
     tile.add_argument("--window", nargs=4, type=int, metavar=("X", "Y", "WIDTH", "HEIGHT"))
+    query = sub.add_parser("query", help="Decode another region from saved cube guides and decoder cache")
+    query.add_argument("--state", required=True, help="Existing completed cube state")
+    query.add_argument("--checkpoint-dir", help="Generation checkpoints; inferred beside --state by default")
+    query.add_argument("--bounds", nargs=4, required=True, type=float, metavar=("WEST","SOUTH","EAST","NORTH"))
+    query.add_argument("--width", required=True, type=int)
+    query.add_argument("--height", required=True, type=int)
+    query.add_argument("--output", required=True)
+    query.add_argument("--climate-output", help="Also export five-band climate from the saved state")
+    query.add_argument("--upstream", default="upstream")
     check = sub.add_parser("verify", help="Check saved state's sphere topology and integrity")
     check.add_argument("--state", required=True)
     sub.add_parser("gui", help="Open the desktop launcher")
@@ -52,19 +62,50 @@ def main(argv=None):
         if args.command == "gui":
             from .gui import main as gui_main
             return gui_main()
-        if args.command in ("generate","export"):
+        if args.command in ("generate","export","query"):
             from pathlib import Path
             if args.climate_output:
                 if Path(args.climate_output).resolve() in (Path(args.output).resolve(),Path(args.state).resolve()):
                     raise ValueError("Climate output must differ from elevation output and state paths")
                 if Path(args.climate_output).exists():
                     raise ValueError("Climate output path must not already exist")
+        if args.command == "query":
+            from pathlib import Path
+            from .backends import DiagnosticBackend, TerrainBackend
+            from .query import load_query, query_region
+            if Path(args.output).exists():
+                raise ValueError("Output path must not already exist")
+            directory, identity, _, _, _ = load_query(args.state,args.checkpoint_dir,
+                                                       with_climate=bool(args.climate_output))
+            if identity.get("backend") == DiagnosticBackend.name:
+                backend = DiagnosticBackend()
+            elif identity.get("backend") == TerrainBackend.name:
+                import torch
+                torch.set_num_threads(int(identity["torch_threads"]))
+                backend = TerrainBackend(args.upstream,identity["model"],
+                                         identity["model_revision"],identity["device"])
+            else:
+                raise ValueError("Unsupported checkpoint backend")
+            elevation, metadata, climate = query_region(
+                backend,args.state,args.bounds,args.width,args.height,directory,
+                with_climate=bool(args.climate_output),
+                progress=lambda s:print(s,file=sys.stderr,flush=True))
+            export_tiff(args.output,elevation,metadata)
+            if args.climate_output:
+                export_tiff(args.climate_output,elevation,metadata,climate=climate)
+            print(json.dumps({"bounds":metadata["bounds"],"width":args.width,
+                              "height":args.height,"regional_execution":metadata["regional_execution"]},indent=2))
+            return 0
         if args.command == "generate":
             from pathlib import Path
             from .backends import DiagnosticBackend, TerrainBackend
             from .generate import generate
             from .seeds import resolve_seed
             checkpoint_dir = args.checkpoint_dir or (args.state+".checkpoints" if args.geometry == "cube" else None)
+            if args.coarse_height is None:
+                args.coarse_height = 1024 if args.regional_only else 8
+            if args.regional_only and (args.geometry != "cube" or args.bounds is None):
+                raise ValueError("--regional-only requires cube geometry and --bounds")
             args.seed = resolve_seed(args.seed,checkpoint_dir if args.geometry == "cube" else None)
             print(f"Seed: {args.seed}",file=sys.stderr,flush=True)
             if Path(args.state).exists() or Path(args.output).exists():
@@ -126,15 +167,22 @@ def main(argv=None):
             progress = lambda s: print(s, file=sys.stderr, flush=True)
             climate = None
             if args.geometry == "cube":
-                from .cube_generate import generate_cube
-                a, metadata, climate = generate_cube(backend,args.seed,args.coarse_height//2,args.coarse_steps,
-                    progress=progress,checkpoint_dir=checkpoint_dir,draft=draft,region=region,
-                    latent_batch_size=args.latent_batch_size,with_climate=True,conditioning=conditioning)
+                if args.regional_only:
+                    from .sparse import SparseWorld
+                    world = SparseWorld(backend,args.seed,args.coarse_height,args.coarse_steps,
+                        args.radius_metres,checkpoint_dir,source=conditioning or draft)
+                    a,metadata,climate = world.region(bounds,args.width,height,
+                        with_climate=bool(args.climate_output),progress=progress)
+                else:
+                    from .cube_generate import generate_cube
+                    a, metadata, climate = generate_cube(backend,args.seed,args.coarse_height//2,args.coarse_steps,
+                        progress=progress,checkpoint_dir=checkpoint_dir,draft=draft,region=region,
+                        latent_batch_size=args.latent_batch_size,with_climate=True,conditioning=conditioning)
             else:
                 a, metadata = generate(backend,args.seed,args.coarse_height,args.coarse_steps,
                     progress=progress,decoder_cache=args.checkpoint_dir)
             metadata["radius_metres"] = args.radius_metres
-            save_state(args.state, a, metadata, climate=climate)
+            save_state(args.state, a, metadata, climate=None if args.regional_only else climate)
             if draft is not None:
                 (Path(args.state)/"draft.png").write_bytes(draft.png_bytes)
             if conditioning is not None:

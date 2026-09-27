@@ -82,6 +82,15 @@ class TiffConditioning:
             guide[channel] = blended
         return cube.identify(encode(guide))
 
+    def conditioning_nodes(self, seed, face, y, x, n, **options):
+        from . import procedural
+        p = cube.directions(face,y,x,n)
+        guide = procedural.sample_raw(seed,p,2*n/np.pi,**options)
+        for channel, raster in self.rasters.items():
+            values, coverage = raster.on_cube_nodes(face,y,x,n)
+            guide[channel] = values+(1-np.clip(coverage,0,1))*guide[channel]
+        return procedural.encode(guide)
+
     def snapshot(self, folder):
         folder = Path(folder)/"conditioning"
         folder.mkdir(parents=True,exist_ok=True)

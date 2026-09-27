@@ -56,7 +56,7 @@ def evaluate(features, longitude, latitude, elevation):
     lon, lat = np.deg2rad(longitude), np.deg2rad(latitude)
     p = np.stack(np.broadcast_arrays(np.cos(lat)*np.cos(lon),
                  np.cos(lat)*np.sin(lon),np.sin(lat)),axis=-1)
-    result = cube.sample(features,p)
+    result = features.sample(p) if hasattr(features,"sample") else cube.sample(features,p)
     result[0] += result[4]*np.maximum(elevation,0.)
     result[1] /= 100.  # Upstream stores temperature standard deviation in degC x100.
     return result.astype(np.float32)
