@@ -178,9 +178,14 @@ def main(argv=None):
                         with_climate=bool(args.climate_output),progress=progress)
                 else:
                     from .cube_generate import generate_cube
-                    a, metadata, climate = generate_cube(backend,args.seed,args.coarse_height//2,args.coarse_steps,
+                    generated = generate_cube(backend,args.seed,args.coarse_height//2,args.coarse_steps,
                         progress=progress,checkpoint_dir=checkpoint_dir,draft=draft,region=region,
-                        latent_batch_size=args.latent_batch_size,with_climate=True,conditioning=conditioning)
+                        latent_batch_size=args.latent_batch_size,
+                        with_climate=bool(args.climate_output),conditioning=conditioning)
+                    if args.climate_output:
+                        a, metadata, climate = generated
+                    else:
+                        a, metadata = generated
             else:
                 a, metadata = generate(backend,args.seed,args.coarse_height,args.coarse_steps,
                     progress=progress,decoder_cache=args.checkpoint_dir)

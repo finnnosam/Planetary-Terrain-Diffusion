@@ -154,7 +154,7 @@ class Launcher:
         self.device = tk.StringVar(value="cpu")
         self.model = tk.StringVar(value="90 m")
         self.latent_batch_size = tk.StringVar(value="1")
-        self.export_climate = tk.BooleanVar(value=True)
+        self.export_climate = tk.BooleanVar(value=False)
         self.regional_only = tk.BooleanVar(value=True)
         self.status = tk.StringVar(value="Choose a PNG draft or TIFF folder, or leave both blank for a procedural planet.")
         ttk.Label(main,text="Generate or query spherical elevation",font=("Segoe UI",15)).grid(row=0,column=0,columnspan=3,sticky="w",pady=(0,12))

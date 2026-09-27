@@ -237,8 +237,8 @@ Existing checkpoints from before this code change require a new run folder.
 
 ### Climate maps
 
-The launcher enables **Export climate maps** by default, producing
-`planet-climate.tif` alongside `planet-native.tif`. The climate TIFF has five
+Select **Export climate maps** in the launcher to produce `planet-climate.tif`
+alongside `planet-native.tif`. The climate TIFF has five
 float32 bands on exactly the same grid, bounds, and spherical CRS as elevation:
 
 | Band | Value | Unit |
@@ -262,11 +262,13 @@ The CLI accepts `--climate-output PATH` for both `generate` and `export`:
 .venv/Scripts/python -m planet_diffusion export --state outputs/climate-planet --height 512 --output outputs/elevation-overview.tif --climate-output outputs/climate-overview.tif
 ```
 
-New CLI cube runs always save compact, checksum-verified climate features in
-`state/climate.npy`, even if TIFF export is disabled. Later exports need no model
-inference. Global overviews, date-line-crossing tiles, and regional exports are
-supported; regional states retain their original bounds and resolution. Older
-elevation-only states remain readable but need regeneration to provide climate.
+Cube runs with `--climate-output` save compact, checksum-verified climate features
+in `state/climate.npy`. Later exports need no model inference. Without that option,
+climate features are not reconstructed or saved, and the state cannot later export
+climate without regeneration. Global overviews, date-line-crossing tiles, and
+regional exports are supported; regional states retain their original bounds and
+resolution. Older elevation-only states remain readable but need regeneration to
+provide climate.
 Climate output is unavailable for the legacy equirectangular generator.
 
 ### Elevation export
