@@ -34,7 +34,7 @@ def python_executable():
     return str(console if path.name.lower() == "pythonw.exe" and console.exists() else path)
 
 
-def build_command(folder, seed, draft="", coarse_height=8, ocean_depth=0., white_metres=6250., device="cpu", refinement=.2, radius_metres=6371000., export_height=None, bounds=None, export_width=None, latent_batch_size=1, export_climate=False):
+def build_command(folder, seed, draft="", coarse_height=8, ocean_depth=0., white_metres=6250., device="cpu", refinement=.2, radius_metres=6371000., export_height=None, bounds=None, export_width=None, latent_batch_size=1, export_climate=False, conditioning_dir="", conditioning_snr=".2,.2,1,.2,1"):
     folder = Path(folder).expanduser().resolve()
     if (folder/"state").exists() or (folder/"planet-native.tif").exists():
         raise ValueError("This run already has output. Choose New run to preserve it.")
@@ -71,6 +71,13 @@ def build_command(folder, seed, draft="", coarse_height=8, ocean_depth=0., white
     model = ROOT/"models"/"terrain-diffusion-90m"
     if model.is_dir():
         cmd += ["--model",str(model)]
+    if conditioning_dir.strip():
+        if draft.strip():
+            raise ValueError("Choose either a PNG draft or a conditioning TIFF folder")
+        from .conditioning import TiffConditioning
+        source = Path(conditioning_dir).expanduser().resolve()
+        TiffConditioning(source,conditioning_snr)
+        cmd += ["--conditioning-dir",str(source),"--snr",conditioning_snr]
     if draft.strip():
         from .draft import Draft
         draft_path = Path(draft).expanduser().resolve()
@@ -88,13 +95,15 @@ class Launcher:
         self.stopping = False
         self.controls = []
         root.title("Planet Terrain Diffusion")
-        root.geometry("940x890")
+        root.geometry("940x950")
         root.minsize(850,800)
         root.protocol("WM_DELETE_WINDOW",self.close)
         main = ttk.Frame(root,padding=16)
         main.pack(fill="both",expand=True)
         main.columnconfigure(1,weight=1)
         self.draft = tk.StringVar()
+        self.conditioning_dir = tk.StringVar()
+        self.climate_refinement = tk.StringVar(value=".2,1,.2,1")
         self.seed = tk.StringVar(value="random")
         self.folder = tk.StringVar()
         self.coarse_height = tk.StringVar(value="16")
@@ -109,7 +118,7 @@ class Launcher:
         self.device = tk.StringVar(value="cpu")
         self.latent_batch_size = tk.StringVar(value="1")
         self.export_climate = tk.BooleanVar(value=True)
-        self.status = tk.StringVar(value="Choose a PNG draft, or leave it blank for a procedural planet.")
+        self.status = tk.StringVar(value="Choose a PNG draft or TIFF folder, or leave both blank for a procedural planet.")
         ttk.Label(main,text="Generate a spherical elevation GeoTIFF",font=("Segoe UI",15)).grid(row=0,column=0,columnspan=3,sticky="w",pady=(0,12))
         self.entry(main,1,"Draft PNG (optional)",self.draft,"Browse…",self.browse_draft)
         ttk.Label(main,text="2:1 global map · north at top · black = ocean · lighter = higher land").grid(row=2,column=0,columnspan=3,sticky="w",pady=(0,12))
@@ -131,7 +140,7 @@ class Launcher:
         self.entry(main,9,"Ocean depth hint (0 = auto)",self.ocean)
         self.entry(main,10,"White land elevation (m)",self.white)
         self.entry(main,11,"Elevation refinement (0.01–4)",self.refinement)
-        ttk.Label(main,text="Default 0.2 · smaller values follow the draft more closely; larger values allow more change.").grid(row=12,column=0,columnspan=3,sticky="w",pady=(4,8))
+        ttk.Label(main,text="For PNG or TIFF elevation · smaller values follow the input more closely; larger values allow more change.").grid(row=12,column=0,columnspan=3,sticky="w",pady=(4,8))
         ttk.Label(main,text="Compute device").grid(row=13,column=0,sticky="w")
         device = ttk.Combobox(main,textvariable=self.device,values=["cpu","cuda"],state="readonly")
         device.grid(row=13,column=1,sticky="ew",padx=8); self.controls.append(device)
@@ -149,17 +158,19 @@ class Launcher:
             widget = ttk.Entry(bounds,textvariable=variable,width=7,state="disabled")
             widget.pack(side="left",padx=(0,8)); self.controls.append(widget); self.bound_controls.append(widget)
         ttk.Label(main,text="East < west crosses the date line. Latitude: −90 to 90. Drafts always cover the globe.").grid(row=17,column=0,columnspan=3,sticky="w",pady=(0,6))
+        self.entry(main,18,"Conditioning TIFF folder (instead of PNG)",self.conditioning_dir,"Browse...",self.browse_conditioning)
+        self.entry(main,19,"TIFF climate refinement: temp, T std, precip, P CV",self.climate_refinement)
         actions = ttk.Frame(main)
-        actions.grid(row=18,column=0,columnspan=3,sticky="ew",pady=8)
+        actions.grid(row=20,column=0,columnspan=3,sticky="ew",pady=8)
         self.generate = ttk.Button(actions,text="Generate / Resume",command=self.start)
         self.generate.pack(side="left"); self.controls.append(self.generate)
         self.stop = ttk.Button(actions,text="Stop",command=self.cancel,state="disabled")
         self.stop.pack(side="left",padx=8)
         ttk.Button(actions,text="Open run folder",command=self.open_folder).pack(side="right")
-        ttk.Label(main,textvariable=self.status,wraplength=850).grid(row=19,column=0,columnspan=3,sticky="w",pady=6)
+        ttk.Label(main,textvariable=self.status,wraplength=850).grid(row=21,column=0,columnspan=3,sticky="w",pady=6)
         logframe = ttk.Frame(main)
-        logframe.grid(row=20,column=0,columnspan=3,sticky="nsew")
-        main.rowconfigure(20,weight=1)
+        logframe.grid(row=22,column=0,columnspan=3,sticky="nsew")
+        main.rowconfigure(22,weight=1)
         self.log = tk.Text(logframe,height=12,wrap="word",state="disabled")
         scroll = ttk.Scrollbar(logframe,command=self.log.yview)
         self.log.configure(yscrollcommand=scroll.set)
@@ -179,6 +190,10 @@ class Launcher:
     def browse_draft(self):
         path = filedialog.askopenfilename(title="Choose a global PNG draft",filetypes=[("PNG image","*.png")])
         if path: self.draft.set(path)
+
+    def browse_conditioning(self):
+        path = filedialog.askdirectory(title="Choose global conditioning TIFF folder")
+        if path: self.conditioning_dir.set(path)
 
     def browse_folder(self):
         path = filedialog.askdirectory(title="Choose an empty run folder, or an interrupted run")
@@ -221,7 +236,9 @@ class Launcher:
                 int(self.export_height.get()),
                 bounds=[float(v.get()) for v in self.bounds] if self.scope.get() == "Region" else None,
                 export_width=int(self.export_width.get()),latent_batch_size=int(self.latent_batch_size.get()),
-                export_climate=self.export_climate.get())
+                export_climate=self.export_climate.get(),
+                conditioning_dir=self.conditioning_dir.get(),
+                conditioning_snr=self.refinement.get()+","+self.climate_refinement.get())
             folder.mkdir(parents=True,exist_ok=True)
             self.seed.set(str(seed))
             self.append(f"\nSeed: {seed}\nRun folder: {folder}\n")

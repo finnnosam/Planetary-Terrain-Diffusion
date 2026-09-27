@@ -5,10 +5,10 @@ from pathlib import Path
 import numpy as np
 from PIL import Image, UnidentifiedImageError
 from . import cube
-from .topology import sample
+from .spherical_raster import GlobalRaster
 
 
-class Draft:
+class Draft(GlobalRaster):
     def __init__(self, path, ocean_depth=0., maximum=4000., refinement=.2):
         if not np.isfinite([ocean_depth, maximum]).all() or ocean_depth < 0 or maximum <= 0:
             raise ValueError("Draft ocean depth must be finite and >=0; white elevation must be finite and >0")
@@ -59,33 +59,6 @@ class Draft:
                          "refinement":self.refinement,
                          "alpha":"transparent uses seeded procedural guide",
                          "sampling":"8x8 area-weighted cube-node footprint; periodic longitude; shared poles"}
-
-    def evaluate(self, directions):
-        p = directions/np.linalg.norm(directions,axis=-1,keepdims=True)
-        h = self.nodes.shape[-2]-1
-        y = h*(.5-np.arcsin(np.clip(p[...,2],-1,1))/np.pi)
-        x = h*(np.arctan2(p[...,1],p[...,0])/np.pi+1)
-        return sample(self.nodes,y,x)
-
-    def on_cube(self, n):
-        if n in self._samples:
-            return self._samples[n]
-        accum = np.zeros((3,6,n+1,n+1),np.float64)
-        norm = np.zeros((6,n+1,n+1),np.float64)
-        offsets = (np.arange(8)+.5)/8-.5
-        # Integrate a coarse-node footprint rather than picking isolated PNG pixels.
-        for f in range(6):
-            for dy in offsets:
-                for dx in offsets:
-                    y = np.arange(n+1)[:,None]+dy
-                    x = np.arange(n+1)[None,:]+dx
-                    p = cube.directions(f,y,x,n,normalize=False)
-                    weight = np.linalg.norm(p,axis=-1)**-3
-                    accum[:,f] += self.evaluate(p)*weight
-                    norm[f] += weight
-        imported = cube.identify(accum/norm)
-        self._samples[n] = imported
-        return imported
 
     def conditioning(self, seed, n):
         guide = cube.conditioning(seed,n)

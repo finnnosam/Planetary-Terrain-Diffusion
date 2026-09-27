@@ -14,6 +14,8 @@ def main(argv=None):
     gen.add_argument("--climate-output", help="Also export a five-band climate GeoTIFF (cube geometry)")
     gen.add_argument("--seed", default="random", help="Unsigned integer, or random (default); printed and saved")
     gen.add_argument("--draft", help="2:1 global PNG: black ocean, lighter shades higher land")
+    gen.add_argument("--conditioning-dir", help="Folder of global elevation/climate conditioning TIFFs; alternative to --draft")
+    gen.add_argument("--snr", help="Five comma-separated TIFF refinement values: elevation, temperature, T std, precipitation, P CV (default .2,.2,1,.2,1)")
     gen.add_argument("--draft-ocean-depth", type=float, default=0., help="Ocean depth prior in metres; 0 = automatic learned bathymetry (default)")
     gen.add_argument("--draft-white-metres", type=float, default=4000., help="Elevation assigned to white (default 4000 m)")
     gen.add_argument("--draft-refinement", type=float, default=.2, help="Upstream conditioning noise, 0.01..4; smaller follows guide more closely (default .2)")
@@ -94,6 +96,14 @@ def main(argv=None):
                 raise ValueError("latent-batch-size requires cube geometry")
             if args.geometry != "cube" and args.climate_output:
                 raise ValueError("Climate output requires cube geometry")
+            conditioning = None
+            if args.snr is not None and not args.conditioning_dir:
+                raise ValueError("--snr requires --conditioning-dir")
+            if args.conditioning_dir:
+                if args.geometry != "cube" or args.draft:
+                    raise ValueError("TIFF conditioning requires cube geometry and cannot be combined with --draft")
+                from .conditioning import TiffConditioning, DEFAULT_SNR
+                conditioning = TiffConditioning(args.conditioning_dir,args.snr if args.snr is not None else DEFAULT_SNR)
             draft = None
             if args.draft:
                 if args.geometry != "cube":
@@ -119,7 +129,7 @@ def main(argv=None):
                 from .cube_generate import generate_cube
                 a, metadata, climate = generate_cube(backend,args.seed,args.coarse_height//2,args.coarse_steps,
                     progress=progress,checkpoint_dir=checkpoint_dir,draft=draft,region=region,
-                    latent_batch_size=args.latent_batch_size,with_climate=True)
+                    latent_batch_size=args.latent_batch_size,with_climate=True,conditioning=conditioning)
             else:
                 a, metadata = generate(backend,args.seed,args.coarse_height,args.coarse_steps,
                     progress=progress,decoder_cache=args.checkpoint_dir)
@@ -127,6 +137,8 @@ def main(argv=None):
             save_state(args.state, a, metadata, climate=climate)
             if draft is not None:
                 (Path(args.state)/"draft.png").write_bytes(draft.png_bytes)
+            if conditioning is not None:
+                conditioning.snapshot(args.state)
             a, metadata = load_state(args.state)
             export_tiff(args.output, a, metadata, height)
             if args.climate_output:

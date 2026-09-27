@@ -11,7 +11,7 @@ from .cache import PredictionCache
 
 def generate_cube(backend, seed, face_coarse=4, coarse_steps=20, progress=print,
                   audit=None, checkpoint_dir=None, draft=None, region=None, latent_batch_size=1,
-                  with_climate=False):
+                  with_climate=False, conditioning=None):
     """Return elevation/metadata; with_climate adds compact climate features as a third result."""
     if (isinstance(latent_batch_size, bool) or not isinstance(latent_batch_size, (int, np.integer))
             or latent_batch_size < 1):
@@ -22,14 +22,22 @@ def generate_cube(backend, seed, face_coarse=4, coarse_steps=20, progress=print,
         from .region import validate_region
         bounds, width, height = region
         bounds = validate_region(bounds, width, height, face_coarse*512)
-    if draft is not None:
+    if draft is not None and conditioning is not None:
+        raise ValueError("Choose either a PNG draft or a conditioning TIFF folder")
+    source = conditioning if conditioning is not None else draft
+    if source is not None:
         backend = copy.copy(backend)
-        backend.cond_snr = np.array([draft.refinement,.2,1.,.2,1.],np.float32)
+        backend.cond_snr = (conditioning.cond_snr.copy() if conditioning is not None
+                            else np.array([draft.refinement,.2,1.,.2,1.],np.float32))
     digest = hashlib.sha256()
     for name in ("cube.py","cube_generate.py","backends.py"):
         digest.update(Path(__file__).with_name(name).read_bytes())
     if draft is not None:
         digest.update(Path(__file__).with_name("draft.py").read_bytes())
+    if source is not None:
+        digest.update(Path(__file__).with_name("spherical_raster.py").read_bytes())
+    if conditioning is not None:
+        digest.update(Path(__file__).with_name("conditioning.py").read_bytes())
     if region is not None:
         digest.update(Path(__file__).with_name("region.py").read_bytes())
     if with_climate:
@@ -48,6 +56,9 @@ def generate_cube(backend, seed, face_coarse=4, coarse_steps=20, progress=print,
         metadata["detail_noise"] = "cube-tile-seeded-v1"
     if draft is not None:
         metadata["draft"] = draft.metadata
+    if conditioning is not None:
+        metadata["conditioning_tiffs"] = conditioning.metadata
+    if source is not None:
         metadata["conditioning_noise"] = backend.cond_snr.tolist()
     directory = Path(checkpoint_dir) if checkpoint_dir else None
     if directory is not None:
@@ -68,6 +79,8 @@ def generate_cube(backend, seed, face_coarse=4, coarse_steps=20, progress=print,
                 temp = directory/"draft.png.tmp"
                 temp.write_bytes(draft.png_bytes)
                 temp.replace(snapshot)
+        if conditioning is not None:
+            conditioning.snapshot(directory)
 
     def record(name,a,save=False):
         if not np.isfinite(a).all():
@@ -100,7 +113,7 @@ def generate_cube(backend, seed, face_coarse=4, coarse_steps=20, progress=print,
         if coarse is None:
             channels = [0,2,3,4,5]
             means, stds = backend.means,backend.stds
-            raw_guide = cube.conditioning(seed,nc) if draft is None else draft.conditioning(seed,nc)
+            raw_guide = cube.conditioning(seed,nc) if source is None else source.conditioning(seed,nc)
             record("raw-conditioning",raw_guide)
             guide = (raw_guide-means[channels,None,None,None])/stds[channels,None,None,None]
             angles = np.arctan(backend.cond_snr)[:,None,None,None]

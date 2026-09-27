@@ -1,0 +1,34 @@
+"""Shared spherical sampling for pixel-centred global input maps."""
+import numpy as np
+from . import cube
+from .topology import sample
+
+
+class GlobalRaster:
+    def evaluate(self, directions):
+        p = directions/np.linalg.norm(directions,axis=-1,keepdims=True)
+        h = self.nodes.shape[-2]-1
+        y = h*(.5-np.arcsin(np.clip(p[...,2],-1,1))/np.pi)
+        x = h*(np.arctan2(p[...,1],p[...,0])/np.pi+1)
+        return sample(self.nodes,y,x)
+
+    def on_cube(self, n):
+        if n in self._samples:
+            return self._samples[n]
+        accum = np.zeros((self.nodes.shape[0],6,n+1,n+1),np.float64)
+        norm = np.zeros((6,n+1,n+1),np.float64)
+        offsets = (np.arange(8)+.5)/8-.5
+        # Integrate a coarse-node footprint rather than picking isolated pixels.
+        for f in range(6):
+            for dy in offsets:
+                for dx in offsets:
+                    y = np.arange(n+1)[:,None]+dy
+                    x = np.arange(n+1)[None,:]+dx
+                    p = cube.directions(f,y,x,n,normalize=False)
+                    weight = np.linalg.norm(p,axis=-1)**-3
+                    accum[:,f] += self.evaluate(p)*weight
+                    norm[f] += weight
+        imported = cube.identify(accum/norm)
+        self._samples[n] = imported
+        return imported
+

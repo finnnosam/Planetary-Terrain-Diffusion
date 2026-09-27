@@ -93,6 +93,56 @@ draft flags are `--draft-ocean-depth 0` and `--draft-white-metres 4000`.
 
 ## Generate and export
 
+### Elevation and climate input maps
+
+Ported from upstream's `tiff-export`: supply **Conditioning TIFF folder** in the
+launcher, or `--conditioning-dir FOLDER` in the CLI, to guide both terrain and
+climate. Use this instead of a PNG draft. The folder needs at least one of:
+
+| File | Values |
+|---|---|
+| `heightmap.tif` | Signed elevation in metres; negative values are ocean |
+| `temperature.tif` | Mean temperature in degrees C |
+| `temperature_std.tif` | Temperature standard deviation in degrees C |
+| `precipitation.tif` | Annual precipitation in mm |
+| `precipitation_cv.tif` | Precipitation coefficient of variation in percent |
+
+Each file must be a **single-band, north-up, 2:1 global GeoTIFF** with a
+geographic CRS in degrees and bounds `(-180, -90, 180, 90)`. Different input
+resolutions are supported. Scale and offset metadata are applied before unit
+conversion. Missing channels, nodata, masked pixels, and nonfinite pixels use
+the seeded procedural guide; coverage boundaries blend smoothly. Variability
+and precipitation values must be nonnegative. Regional or projected input maps,
+including unconverted planar Azgaar exports, must first be mapped onto this global
+grid; assigning them a geographic CRS alone is insufficient.
+
+Inputs are averaged over spherical coarse-cell footprints, wrap at the date
+line, and share pole and cube-edge values. Elevation is converted to upstream's
+signed square-root representation and temperature variability to its internal
+hundredths of a degree. These maps guide model refinement, rather than replacing
+the generated output. Very small input features may disappear at coarse resolution.
+
+In the launcher, **Elevation refinement** controls elevation for either PNG or
+TIFF inputs. **TIFF climate refinement** contains only the four climate values:
+temperature, temperature standard deviation, precipitation, and precipitation
+coefficient of variation (defaults `0.2,1.0,0.2,1.0`).
+The CLI's `--snr` still accepts all five comma-separated values in table order,
+each from `0.01` to `4`. Defaults match upstream's TIFF command:
+`0.2,0.2,1.0,0.2,1.0`. Smaller values follow the respective input more closely.
+The CLI's `--draft-refinement` applies only to PNG drafts.
+
+```powershell
+.venv/Scripts/python -m planet_diffusion generate --conditioning-dir E:/maps/global-guide --snr 0.2,0.2,1,0.2,1 --seed 42 --device cuda --coarse-height 16 --state outputs/guided-planet --output outputs/guided-planet.tif --climate-output outputs/guided-climate.tif
+```
+
+TIFF conditioning supports both whole-globe and regional cube generation. The
+original TIFF bytes are saved in `STATE/conditioning/` and
+`CHECKPOINT_DIR/conditioning/`. Content hashes and refinement values are part of
+checkpoint identity, so changed inputs cannot silently resume an older run. To
+resume after moving the original folder, pass the checkpoint's `conditioning/`
+folder with the same refinement values. Existing checkpoints from before this
+code change require a new run folder.
+
 Set **Latent batch size** in the launcher or pass `--latent-batch-size 2` to
 evaluate multiple latent patches per model call. This applies to whole-globe
 and regional cube generation. The default is `1`; increase cautiously because
