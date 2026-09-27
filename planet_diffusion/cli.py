@@ -19,7 +19,7 @@ def main(argv=None):
     gen.add_argument("--draft-ocean-depth", type=float, default=0., help="Ocean depth prior in metres; 0 = automatic learned bathymetry (default)")
     gen.add_argument("--draft-white-metres", type=float, default=4000., help="Elevation assigned to white (default 4000 m)")
     gen.add_argument("--draft-refinement", type=float, default=.2, help="Upstream conditioning noise, 0.01..4; smaller follows guide more closely (default .2)")
-    gen.add_argument("--coarse-height", type=int, help="Logical guide height, multiple of 4; default 8 dense or 1024 regional-only")
+    gen.add_argument("--coarse-height", type=int, help="Logical guide height, multiple of 4; regional default 1024 (90 m) or 2560 (30 m)")
     gen.add_argument("--regional-only", action="store_true", help="Use sparse fixed-grid guides; requires --bounds")
     gen.add_argument("--coarse-steps", type=int, default=20)
     gen.add_argument("--latent-batch-size", type=int, default=1,
@@ -34,9 +34,10 @@ def main(argv=None):
                      help="cube generates on six spherical charts; equirectangular is legacy v2")
     gen.add_argument("--checkpoint-dir", help="Cube checkpoints (default: STATE.checkpoints); legacy decoder cache")
     gen.add_argument("--upstream", default="upstream")
-    gen.add_argument("--model", default="xandergos/terrain-diffusion-90m")
-    from .backends import MODEL_REVISION
-    gen.add_argument("--revision", default=MODEL_REVISION, help="HF revision (default: pinned 90m checkpoint)")
+    from .model_presets import MODEL_90M
+    gen.add_argument("--model", default=MODEL_90M,
+                     help="Upstream model ID or local folder; 30 m and 90 m checkpoints are supported")
+    gen.add_argument("--revision", help="HF revision (default: pinned revision for 30 m or 90 m model)")
     gen.add_argument("--device", choices=["cpu", "cuda"], default="cpu")
     gen.add_argument("--threads", type=int, default=4, help="CPU torch threads (default: 4)")
     tile = sub.add_parser("export", help="Export native-resolution tiles or another overview from saved state")
@@ -100,10 +101,11 @@ def main(argv=None):
             from pathlib import Path
             from .backends import DiagnosticBackend, TerrainBackend
             from .generate import generate
+            from .model_presets import default_revision, sparse_guide_height
             from .seeds import resolve_seed
             checkpoint_dir = args.checkpoint_dir or (args.state+".checkpoints" if args.geometry == "cube" else None)
             if args.coarse_height is None:
-                args.coarse_height = 1024 if args.regional_only else 8
+                args.coarse_height = sparse_guide_height(args.model) if args.regional_only else 8
             if args.regional_only and (args.geometry != "cube" or args.bounds is None):
                 raise ValueError("--regional-only requires cube geometry and --bounds")
             args.seed = resolve_seed(args.seed,checkpoint_dir if args.geometry == "cube" else None)
@@ -163,7 +165,8 @@ def main(argv=None):
             else:
                 import torch
                 torch.set_num_threads(args.threads)
-                backend = TerrainBackend(args.upstream, args.model, args.revision, args.device)
+                backend = TerrainBackend(args.upstream, args.model,
+                                         args.revision or default_revision(args.model), args.device)
             progress = lambda s: print(s, file=sys.stderr, flush=True)
             climate = None
             if args.geometry == "cube":

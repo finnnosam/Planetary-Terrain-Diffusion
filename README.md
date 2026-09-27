@@ -26,7 +26,6 @@ Install each Python package:
 | Rasterio | `.venv/Scripts/python -m pip install "rasterio>=1.4"` |
 | Pillow | `.venv/Scripts/python -m pip install "Pillow>=10"` |
 | FastNoiseLite | `.venv/Scripts/python -m pip install "pyfastnoiselite==0.0.7"` |
-| FastNoiseLite | `.venv/Scripts/python -m pip install "pyfastnoiselite==0.0.7"` |
 | PyTorch | `.venv/Scripts/python -m pip install "torch>=2.4"` |
 | Diffusers | `.venv/Scripts/python -m pip install "diffusers>=0.30"` |
 | Safetensors | `.venv/Scripts/python -m pip install "safetensors>=0.4"` |
@@ -41,8 +40,10 @@ git clone https://github.com/xandergos/terrain-diffusion.git upstream
 git -C upstream checkout e8dcb4b1a834ab2f6b1a6f5256ed7c9f2f3e8230
 ```
 
-The first model run downloads about 1.14 GB of weights. This workspace already
-has them in `models/terrain-diffusion-90m/`. For GPU generation, install a
+Each model has about 1.14 GB of weights. This workspace includes the 90 m
+model in `models/terrain-diffusion-90m/`; the launcher uses a complete local
+30 m download from `models/terrain-diffusion-30m/` when present, or fetches the
+pinned upstream revision on first use. For GPU generation, install a
 CUDA-enabled PyTorch build for your system and select `--device cuda`.
 
 ### Desktop launcher
@@ -60,10 +61,11 @@ in pixels. East smaller than west crosses the date line (for example, west
 170 and east −170 covers 20 degrees). Polar regions are supported. Whole-globe
 output requires width = twice height; a region can have any aspect ratio.
 
-**Coarse height** still sets detail density on the sphere. The launcher reports
-the minimum coarse height if a region's requested pixel resolution exceeds
-that density. Larger coarse heights increase global guide work, even for a
-small region. Output dimensions do not change the sphere's radius or location.
+**Logical guide height** sets detail density on the sphere. The launcher reports
+the minimum height if a region's requested pixel resolution exceeds that
+density. With regional-only generation, larger heights increase work near the
+requested region but do not generate a full-world guide. Output dimensions do
+not change the sphere's radius or location.
 
 ### Procedural globe conditioning
 
@@ -286,7 +288,8 @@ are protected from overwriting.
 
 For genuinely regional model work, choose **Region** in the launcher and leave
 **Only generate requested region** checked. The launcher sets a logical guide
-height of 1024, equivalent to a 2048×1024 coarse placement grid. It allocates
+height of 1024 for the 90 m model, equivalent to a 2048×1024 coarse placement
+grid. It allocates
 no full-grid coarse, latent, or native elevation array: fixed cube-face tile
 coordinates determine where cells may exist, and only tiles required by the
 requested area and model/filter halos are evaluated. With the default Earth
@@ -308,6 +311,30 @@ model context and additional stage halos may reach well outside the requested
 rectangle. At guide height 1024 this coarse context is roughly 1,250 km near
 the equator on an Earth-sized globe. Conditioning PNGs and TIFFs are loaded as
 source files, while only their requested coarse-node footprints are sampled.
+
+#### 30 m model
+
+Choose **30 m** under **Terrain model** in the launcher for the upstream's
+finer-detail model. With **Region** and **Only generate requested region**, the
+launcher selects a logical guide height of 2560. At the default Earth radius,
+that gives about 30.5 m equatorial native spacing and about 7.8 km per coarse
+cell, close to the model's 30 m / 7.7 km training scale. The same fixed grid is
+used for later **Saved run query** requests. A 30 m run needs its own run folder;
+its checkpoints cannot be mixed with a 90 m run.
+
+The CLI can select the model directly. When `--regional-only` is set and
+`--coarse-height` is omitted, the 30 m model automatically selects height 2560:
+
+```powershell
+.venv/Scripts/python -m planet_diffusion generate --regional-only --model xandergos/terrain-diffusion-30m --device cuda --bounds -0.1 -0.1 0.1 0.1 --width 512 --height 512 --state outputs/local30/state --output outputs/local30/region.tif
+```
+
+The launcher uses a complete `models/terrain-diffusion-30m/` folder when one is
+available. Otherwise it downloads the pinned 30 m revision; the CLI example
+above fetches that revision through Hugging Face. Pass
+`--model models/terrain-diffusion-30m` to use a local copy from the CLI. A
+512-pixel output covering 0.2° spans about 43 m per pixel at the equator; use
+narrower bounds or more pixels to retain the model's full native detail.
 
 Sparse climate is recomputed on demand for `generate --climate-output` or
 `query --climate-output`; it is not stored as a dense climate field in the

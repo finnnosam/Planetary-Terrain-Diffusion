@@ -11,6 +11,7 @@ import threading
 import time
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
+from .model_presets import MODEL_30M, MODEL_90M, default_revision, local_checkpoint, sparse_guide_height
 from .seeds import resolve_seed
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -34,7 +35,7 @@ def python_executable():
     return str(console if path.name.lower() == "pythonw.exe" and console.exists() else path)
 
 
-def build_command(folder, seed, draft="", coarse_height=8, ocean_depth=0., white_metres=6250., device="cpu", refinement=.2, radius_metres=6371000., export_height=None, bounds=None, export_width=None, latent_batch_size=1, export_climate=False, conditioning_dir="", conditioning_snr=".2,.2,1,.2,1", regional_only=False):
+def build_command(folder, seed, draft="", coarse_height=8, ocean_depth=0., white_metres=6250., device="cpu", refinement=.2, radius_metres=6371000., export_height=None, bounds=None, export_width=None, latent_batch_size=1, export_climate=False, conditioning_dir="", conditioning_snr=".2,.2,1,.2,1", regional_only=False, model_choice="90 m"):
     folder = Path(folder).expanduser().resolve()
     if (folder/"state").exists() or (folder/"planet-native.tif").exists():
         raise ValueError("This run already has output. Choose New run to preserve it.")
@@ -72,9 +73,11 @@ def build_command(folder, seed, draft="", coarse_height=8, ocean_depth=0., white
         cmd += ["--bounds",*[str(v) for v in bounds],"--width",str(export_width)]
     if regional_only:
         cmd += ["--regional-only"]
-    model = ROOT/"models"/"terrain-diffusion-90m"
-    if model.is_dir():
-        cmd += ["--model",str(model)]
+    if model_choice not in ("90 m", "30 m"):
+        raise ValueError("Choose a 30 m or 90 m model")
+    model_id = MODEL_30M if model_choice == "30 m" else MODEL_90M
+    model = local_checkpoint(ROOT/"models",model_id) or model_id
+    cmd += ["--model",str(model),"--revision",default_revision(model_id)]
     if conditioning_dir.strip():
         if draft.strip():
             raise ValueError("Choose either a PNG draft or a conditioning TIFF folder")
@@ -149,6 +152,7 @@ class Launcher:
         self.ocean = tk.StringVar(value="0")
         self.white = tk.StringVar(value="6250")
         self.device = tk.StringVar(value="cpu")
+        self.model = tk.StringVar(value="90 m")
         self.latent_batch_size = tk.StringVar(value="1")
         self.export_climate = tk.BooleanVar(value=True)
         self.regional_only = tk.BooleanVar(value=True)
@@ -178,24 +182,28 @@ class Launcher:
         ttk.Label(main,text="Compute device").grid(row=13,column=0,sticky="w")
         device = ttk.Combobox(main,textvariable=self.device,values=["cpu","cuda"],state="readonly")
         device.grid(row=13,column=1,sticky="ew",padx=8); self.controls.append(device)
-        self.entry(main,14,"Latent batch size (larger uses more memory)",self.latent_batch_size)
-        ttk.Label(main,text="Generation area / saved query").grid(row=15,column=0,sticky="w")
+        ttk.Label(main,text="Terrain model").grid(row=14,column=0,sticky="w")
+        model = ttk.Combobox(main,textvariable=self.model,values=["90 m","30 m"],state="readonly")
+        model.grid(row=14,column=1,sticky="ew",padx=8); self.controls.append(model)
+        model.bind("<<ComboboxSelected>>",self.change_model)
+        self.entry(main,15,"Latent batch size (larger uses more memory)",self.latent_batch_size)
+        ttk.Label(main,text="Generation area / saved query").grid(row=16,column=0,sticky="w")
         scope = ttk.Combobox(main,textvariable=self.scope,values=["Whole globe","Region","Saved run query"],state="readonly")
-        scope.grid(row=15,column=1,sticky="ew",padx=8); self.controls.append(scope)
+        scope.grid(row=16,column=1,sticky="ew",padx=8); self.controls.append(scope)
         scope.bind("<<ComboboxSelected>>",self.change_scope)
-        ttk.Label(main,text="Regional bounds (degrees)").grid(row=16,column=0,sticky="w")
+        ttk.Label(main,text="Regional bounds (degrees)").grid(row=17,column=0,sticky="w")
         bounds = ttk.Frame(main)
-        bounds.grid(row=16,column=1,columnspan=2,sticky="ew",padx=8,pady=6)
+        bounds.grid(row=17,column=1,columnspan=2,sticky="ew",padx=8,pady=6)
         self.bound_controls = []
         for label,variable in zip(("West","South","East","North"),self.bounds):
             ttk.Label(bounds,text=label).pack(side="left",padx=(0,4))
             widget = ttk.Entry(bounds,textvariable=variable,width=7,state="disabled")
             widget.pack(side="left",padx=(0,8)); self.controls.append(widget); self.bound_controls.append(widget)
-        ttk.Label(main,text="East < west crosses the date line. Latitude: −90 to 90. Drafts always cover the globe.").grid(row=17,column=0,columnspan=3,sticky="w",pady=(0,6))
-        self.entry(main,18,"Conditioning TIFF folder (instead of PNG)",self.conditioning_dir,"Browse...",self.browse_conditioning)
-        self.entry(main,19,"TIFF climate refinement: temp, T std, precip, P CV",self.climate_refinement)
+        ttk.Label(main,text="East < west crosses the date line. Latitude: −90 to 90. Drafts always cover the globe.").grid(row=18,column=0,columnspan=3,sticky="w",pady=(0,6))
+        self.entry(main,19,"Conditioning TIFF folder (instead of PNG)",self.conditioning_dir,"Browse...",self.browse_conditioning)
+        self.entry(main,20,"TIFF climate refinement: temp, T std, precip, P CV",self.climate_refinement)
         actions = ttk.Frame(main)
-        actions.grid(row=20,column=0,columnspan=3,sticky="ew",pady=8)
+        actions.grid(row=21,column=0,columnspan=3,sticky="ew",pady=8)
         self.generate = ttk.Button(actions,text="Generate / Resume",command=self.start)
         self.generate.pack(side="left"); self.controls.append(self.generate)
         sparse = ttk.Checkbutton(actions,text="Only generate requested region",variable=self.regional_only,
@@ -204,10 +212,10 @@ class Launcher:
         self.stop = ttk.Button(actions,text="Stop",command=self.cancel,state="disabled")
         self.stop.pack(side="left",padx=8)
         ttk.Button(actions,text="Open run folder",command=self.open_folder).pack(side="right")
-        ttk.Label(main,textvariable=self.status,wraplength=850).grid(row=21,column=0,columnspan=3,sticky="w",pady=6)
+        ttk.Label(main,textvariable=self.status,wraplength=850).grid(row=22,column=0,columnspan=3,sticky="w",pady=6)
         logframe = ttk.Frame(main)
-        logframe.grid(row=22,column=0,columnspan=3,sticky="nsew")
-        main.rowconfigure(22,weight=1)
+        logframe.grid(row=23,column=0,columnspan=3,sticky="nsew")
+        main.rowconfigure(23,weight=1)
         self.log = tk.Text(logframe,height=12,wrap="word",state="disabled")
         scroll = ttk.Scrollbar(logframe,command=self.log.yview)
         self.log.configure(yscrollcommand=scroll.set)
@@ -264,12 +272,12 @@ class Launcher:
             self.status.set("Choose a completed run folder, enter bounds and output resolution, then query its saved guides.")
         elif self.scope.get() == "Region" and self.regional_only.get():
             if self.coarse_height.get() == "16":
-                self.coarse_height.set("1024")
+                self.coarse_height.set(str(self.preferred_sparse_height()))
             if [v.get() for v in self.bounds] == ["-30","-30","30","30"]:
                 for variable,value in zip(self.bounds,("-2","-2","2","2")):
                     variable.set(value)
             self.status.set("Sparse regional guides use a fixed global cell grid; only nearby model tiles are computed.")
-        elif self.coarse_height.get() == "1024":
+        elif self.coarse_height.get() in ("1024","2560"):
             self.coarse_height.set("16")
         coarse = int(self.coarse_height.get()) if self.coarse_height.get().isdigit() else 16
         self.export_width.set("512" if regional else str(coarse*512))
@@ -279,9 +287,17 @@ class Launcher:
         if self.scope.get() != "Region":
             return
         if self.regional_only.get() and self.coarse_height.get() == "16":
-            self.coarse_height.set("1024")
-        elif not self.regional_only.get() and self.coarse_height.get() == "1024":
+            self.coarse_height.set(str(self.preferred_sparse_height()))
+        elif not self.regional_only.get() and self.coarse_height.get() in ("1024","2560"):
             self.coarse_height.set("16")
+
+    def preferred_sparse_height(self):
+        return sparse_guide_height(MODEL_30M if self.model.get() == "30 m" else MODEL_90M)
+
+    def change_model(self,event=None):
+        if (self.scope.get() == "Region" and self.regional_only.get()
+                and self.coarse_height.get() in ("1024","2560")):
+            self.coarse_height.set(str(self.preferred_sparse_height()))
 
     def start(self):
         try:
@@ -304,7 +320,8 @@ class Launcher:
                 export_climate=self.export_climate.get(),
                 conditioning_dir=self.conditioning_dir.get(),
                 conditioning_snr=self.refinement.get()+","+self.climate_refinement.get(),
-                regional_only=self.regional_only.get() and self.scope.get() == "Region")
+                regional_only=self.regional_only.get() and self.scope.get() == "Region",
+                model_choice=self.model.get())
             folder.mkdir(parents=True,exist_ok=True)
             self.seed.set(str(seed))
             self.append(f"\nSeed: {seed}\nRun folder: {folder}\n")
