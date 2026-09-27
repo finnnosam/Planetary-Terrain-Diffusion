@@ -9,6 +9,7 @@ import time
 import numpy as np
 from . import cube
 from .cache import PredictionCache
+from .detail import decoder_conditioning, DECODER_SIZE, DECODER_STRIDE
 
 
 def validate_region(bounds, width, height, native_height=None):
@@ -34,9 +35,14 @@ def validate_region(bounds, width, height, native_height=None):
 
 
 class Field:
-    """Lazy scalar shared-node cube field. raw() returns un-identified nodes."""
-    def __init__(self, n, raw, tile=32, noise=False, cache_bytes=16*1024**2):
+    """Lazy scalar shared-node field; weighted raw() returns (sum, weight).
+
+    Weighted fields combine all chart contributions before normalization at
+    shared nodes, matching dense consensus rather than averaging face means.
+    """
+    def __init__(self, n, raw, tile=32, noise=False, cache_bytes=16*1024**2, weighted=False):
         self.n, self.raw, self.tile, self.noise = n, raw, tile, noise
+        self.weighted = weighted
         # A fixed 128 entries held only 32 KiB at the low-frequency level and
         # thrashed when a latitude scan revisited adjacent cube tiles. Budget
         # each stage in bytes so reconstruction halos survive those scans.
@@ -45,14 +51,16 @@ class Field:
     def _block(self, face, ty, tx):
         y = np.arange(ty*self.tile, min((ty+1)*self.tile, self.n+1))[:, None]
         x = np.arange(tx*self.tile, min((tx+1)*self.tile, self.n+1))[None, :]
-        value = np.broadcast_to(self.raw(face, y, x), (len(y), x.shape[1])).astype(np.float32).copy()
+        raw = self.raw(face,y,x)
+        values = raw[0]/raw[1] if self.weighted else raw
+        value = np.broadcast_to(values, (len(y), x.shape[1])).astype(np.float32).copy()
         yy, xx = np.broadcast_arrays(y, x)
         boundary = (yy == 0) | (yy == self.n) | (xx == 0) | (xx == self.n)
         if boundary.any():
             # All charts representing this exact physical edge/corner participate.
             p = cube.directions(face, yy[boundary], xx[boundary], self.n, normalize=False)
             sums = np.zeros(len(p), np.float64)
-            counts = np.zeros(len(p), int)
+            counts = np.zeros(len(p), np.float64)
             for other in range(6):
                 den = p @ cube.NORMAL[other]
                 use = np.isclose(den, 1, atol=1e-12, rtol=0)
@@ -61,8 +69,9 @@ class Field:
                 if use.any():
                     oy = np.rint(self.n*(1+p[use] @ cube.DOWN[other])/2).astype(int)
                     ox = np.rint(self.n*(1+p[use] @ cube.RIGHT[other])/2).astype(int)
-                    sums[use] += self.raw(other, oy, ox)
-                    counts[use] += 1
+                    raw = self.raw(other,oy,ox)
+                    sums[use] += raw[0] if self.weighted else raw
+                    counts[use] += raw[1] if self.weighted else 1
             value[boundary] = sums/counts
         if not np.isfinite(value).all():
             raise FloatingPointError("Nonfinite regional cube field")
@@ -192,8 +201,7 @@ def generate_region(backend, latent, seed, bounds, width, height, metadata, dire
 
     def predict(a, f, y, x):
         nonlocal model_calls, model_seconds
-        cond = cube.read(latent[:4], f, np.floor_divide(np.arange(y,y+512),8)[:,None],
-                         np.floor_divide(np.arange(x,x+512),8)[None,:], nearest=True)
+        cond = decoder_conditioning(latent,f,y,x)
         before = time.perf_counter()
         prediction = backend.predict('decoder', a, cond, t)
         model_seconds += time.perf_counter()-before
@@ -215,27 +223,31 @@ def generate_region(backend, latent, seed, bounds, width, height, metadata, dire
         if (f,y,x) not in seen:
             seen.add((f,y,x))
             if len(seen) == 1 or len(seen)%16 == 0:
-                progress(f"regional decoder: {len(seen)} unique patches used (global would use {6*(n//256+1)**2})")
+                progress(f"regional decoder: {len(seen)} unique patches used (global would use {6*len(cube.tile_positions(n,DECODER_SIZE,DECODER_STRIDE,True))**2})")
         return prediction
 
-    w = np.maximum(1e-3, 1-np.abs(np.linspace(-1,1,512)))
+    weights = cube.linear_weight_window(DECODER_SIZE)
     def residual_raw(f, y, x):
         y, x = np.broadcast_arrays(y, x)
         total, norm = np.zeros(y.shape, np.float64), np.zeros(y.shape, np.float64)
-        for by, bx in np.unique(np.stack([y.ravel()//256, x.ravel()//256], axis=1), axis=0):
-            use = (y//256 == by) & (x//256 == bx)
-            for py in (int(by-1)*256, int(by)*256):
-                for px in (int(bx-1)*256, int(bx)*256):
-                    if py >= n or px >= n:
+        stride = DECODER_STRIDE
+        for by, bx in np.unique(np.stack([y.ravel()//stride, x.ravel()//stride], axis=1), axis=0):
+            group = (y//stride == by) & (x//stride == bx)
+            for py in (int(by-1)*stride, int(by)*stride):
+                for px in (int(bx-1)*stride, int(bx)*stride):
+                    if py > n or px > n:
+                        continue
+                    use = group & (y >= py) & (y < py+DECODER_SIZE) & (x >= px) & (x < px+DECODER_SIZE)
+                    if not use.any():
                         continue
                     dy, dx = y[use]-py, x[use]-px
-                    weight = w[dy]*w[dx]
+                    weight = weights[dy,dx]
                     total[use] += patch(f,py,px)[dy,dx]*weight
                     norm[use] += weight
-        value = (np.cos(t)*np.sin(t)*noise.read(f,y,x)+np.sin(t)*(total/norm)).astype(np.float32)
-        return value*backend.residual_std+backend.residual_mean
+        value = np.cos(t)*np.sin(t)*noise.read(f,y,x)*norm+np.sin(t)*total
+        return value*backend.residual_std+backend.residual_mean*norm, norm
 
-    elevation = reconstruct(Field(n, residual_raw), latent[4:5]*38.6-31.4)
+    elevation = reconstruct(Field(n, residual_raw,weighted=True), latent[4:5]*38.6-31.4)
     # Square nodes before interpolation, as in the global generator.
     square = Field(n, lambda f,y,x: np.sign(z := elevation.read(f,y,x))*z*z)
     west, south, east, north = bounds

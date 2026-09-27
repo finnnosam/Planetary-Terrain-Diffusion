@@ -105,14 +105,40 @@ nearest-node reads across faces. Shared edge and corner entries combine weighted
 sums before normalization. This preserves identical boundary values; it does not
 prove derivative continuity. On small globes, a 64-cell context exceeds a face,
 so the existing gnomonic halo projection stretches and repeats source nodes.
-There is no intermediate per-step consensus in the coarse stage. Latent and
-decoder sampling are unchanged. Start a new run folder for this sampler version.
+There is no intermediate per-step consensus in the coarse stage.
 
 For a reproducible pretrained coarse-only comparison of the old loop, a larger
 context with per-step blending, and completed-tile blending, install Matplotlib
 and run `python tools/compare_coarse.py --output outputs/coarse-comparison`.
 It saves arrays, area-weighted guide adherence metrics and comparison images.
 These coarse elevation proxies are not final decoded terrain.
+
+### Latent and decoder assembly
+
+Latents follow the source's default `T=2` path: 64 x 64 tiles at stride 32,
+a normalized blend between the two passes, and a 4 x 4 coarse window offset
+by -1 coarse node. The decoder reads completed latent nodes, repeats each into
+an 8 x 8 block, and uses 512 x 512 tiles at the source's default stride 384.
+Both stages use the exact source linear weight ramp, include every overlapping
+tile at the final shared node, and combine shared weighted sums before division.
+The regional decoder uses the same placement and weighting rules.
+
+Nearest-node cross-face sampling is retained for latent state and decoder
+conditioning as well as Gaussian noise. Bilinear learned-field halos were
+tested but reduced fine residual variation without consistent edge improvement.
+The existing global and regional noise generators are unchanged. Shared node
+values agree exactly; this is not a guarantee of matching boundary derivatives.
+
+`tools/compare_detail.py` reproduces the pretrained before/after comparison,
+including weighting-only and rejected interpolated-halo variants. It requires
+Matplotlib and the local pretrained models. For example:
+
+```powershell
+.venv/Scripts/python tools/compare_detail.py --output outputs/detail-comparison --face-coarse 4 --seed 123
+```
+
+Use a new checkpoint directory after this assembly change. The implementation
+and assembly settings are included in checkpoint identity.
 
 ### PNG draft convention
 

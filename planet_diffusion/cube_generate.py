@@ -9,6 +9,7 @@ from . import cube
 from .cache import PredictionCache
 from . import procedural
 from .coarse import sample_coarse, VERSION as COARSE_VERSION, TILE_SIZE, TILE_STRIDE
+from .detail import sample_latents, decoder_conditioning, DECODER_SIZE, DECODER_STRIDE, VERSION as DETAIL_VERSION
 
 
 def generate_cube(backend, seed, face_coarse=4, coarse_steps=20, progress=print,
@@ -32,7 +33,7 @@ def generate_cube(backend, seed, face_coarse=4, coarse_steps=20, progress=print,
         backend.cond_snr = (conditioning.cond_snr.copy() if conditioning is not None
                             else np.array([draft.refinement,.2,1.,.2,1.],np.float32))
     digest = hashlib.sha256()
-    for name in ("cube.py","cube_generate.py","backends.py","procedural.py","coarse.py"):
+    for name in ("cube.py","cube_generate.py","backends.py","procedural.py","coarse.py","detail.py"):
         digest.update(Path(__file__).with_name(name).read_bytes())
     for name in ("synthetic_map_stats.json", "elevation_reference.npz"):
         digest.update((procedural.DATA/name).read_bytes())
@@ -65,6 +66,9 @@ def generate_cube(backend, seed, face_coarse=4, coarse_steps=20, progress=print,
         "pyfastnoiselite":importlib.metadata.version("pyfastnoiselite")}
     metadata["coarse_sampling"] = {"version":COARSE_VERSION, "tile_size":TILE_SIZE,
                                    "tile_stride":TILE_STRIDE, "blend":"completed tiles; shared weighted sums"}
+    metadata["detail_sampling"] = {"version":DETAIL_VERSION,"latent_size":64,"latent_stride":32,
+                                   "decoder_size":DECODER_SIZE,"decoder_stride":DECODER_STRIDE,
+                                   "halos":"nearest shared nodes; decoder repeats latent nodes 8x"}
     if region is not None:
         metadata["algorithm"] = "cubed-sphere-regional-v1"
         metadata["detail_noise"] = "cube-tile-seeded-v1"
@@ -130,23 +134,7 @@ def generate_cube(backend, seed, face_coarse=4, coarse_steps=20, progress=print,
                          else source.conditioning(seed,nc,**options))
             coarse = sample_coarse(backend,seed,raw_guide,coarse_steps,progress,record)
             coarse = record("coarse",cube.identify(coarse),save=True)
-        state = np.zeros((5,6,nl+1,nl+1),np.float32)
-        for step,t in enumerate([float(np.arctan(160)),float(np.arctan(.7))]):
-            progress(f"cube latent {step+1}/2")
-            xt = record(f"latent-noisy-{step}",(np.cos(t)*state+np.sin(t)*cube.noise(seed,5819+step,5,nl)).astype(np.float32))
-            def predict(a,f,y,x):
-                cond = cube.read(coarse,f,(y/32-1+np.arange(4))[:,None],(x/32-1+np.arange(4))[None,:])
-                return backend.predict("latent",a,cond,t)
-            def predict_batch(a,locations):
-                cond = np.stack([cube.read(coarse,f,(y/32-1+np.arange(4))[:,None],
-                                          (x/32-1+np.arange(4))[None,:]) for f,y,x in locations])
-                return backend.predict_batch("latent",a,cond,t)
-            pred = cube.consensus(xt,predict,size=64,stride=32,
-                                  batch_size=latent_batch_size,
-                                  predict_batch=predict_batch if hasattr(backend,"predict_batch") else None,
-                                  progress=lambda d,n:progress(f"cube latent {step+1}/2: {d}/{n} patches"))
-            state = cube.identify(np.cos(t)*xt+np.sin(t)*pred)
-            state = record(f"latent-{step}",state)
+        state = sample_latents(backend,coarse,seed,progress,record,latent_batch_size)
         latent = record("latent",state,save=True)
 
     climate = None
@@ -172,13 +160,13 @@ def generate_cube(backend, seed, face_coarse=4, coarse_steps=20, progress=print,
         t = float(np.arctan(160))
         xt = record("decoder-noise",cube.noise(seed,6819,1,nd)*np.sin(t))
         def decode(a,f,y,x):
-            cond = cube.read(latent[:4],f,np.floor_divide(np.arange(y,y+512),8)[:,None],
-                             np.floor_divide(np.arange(x,x+512),8)[None,:],nearest=True)
+            cond = decoder_conditioning(latent,f,y,x)
             return backend.predict("decoder",a,cond,t)
         if directory is not None:
             identity = {"generation":metadata,"latent_sha256":hashlib.sha256(latent.tobytes()).hexdigest()}
             decode = PredictionCache(directory/"decoder",identity,decode)
-        pred = cube.consensus(xt,decode,size=512,stride=256,
+        pred = cube.consensus(xt,decode,size=DECODER_SIZE,stride=DECODER_STRIDE,
+                              weight_window=cube.linear_weight_window(DECODER_SIZE),shared_weights=True,include_endpoint=True,
                               progress=lambda d,n:progress(f"cube decoder: {d}/{n} patches"))
         residual = record("residual",cube.identify(np.cos(t)*xt+np.sin(t)*pred),save=True)
     progress("cube low-frequency reconstruction")

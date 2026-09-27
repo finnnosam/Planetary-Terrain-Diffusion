@@ -8,6 +8,7 @@ from planet_diffusion.backends import DiagnosticBackend
 from planet_diffusion.storage import save_state, load_state, export_tiff, verify_state
 from planet_diffusion.gui import build_command
 from planet_diffusion.cache import PredictionCache
+from planet_diffusion.detail import decoder_conditioning, DECODER_STRIDE
 
 
 def materialize(field):
@@ -105,10 +106,10 @@ def test_regional_decoder_matches_dense_at_seams_poles_and_overlaps(tmp_path):
     t = float(np.arctan(160))
     xt = noise*np.sin(t)
     def predict(a,f,y,x):
-        cond = cube.read(latent[:4],f,np.floor_divide(np.arange(y,y+512),8)[:,None],
-                         np.floor_divide(np.arange(x,x+512),8)[None,:],nearest=True)
+        cond = decoder_conditioning(latent,f,y,x)
         return backend.predict('decoder',a,cond,t)
-    pred = cube.consensus(xt,predict,512,256)
+    pred = cube.consensus(xt,predict,512,DECODER_STRIDE,weight_window=cube.linear_weight_window(512),
+                          shared_weights=True,include_endpoint=True)
     residual = cube.identify(np.cos(t)*xt+np.sin(t)*pred)
     z = cube.reconstruct(residual*backend.residual_std+backend.residual_mean,latent[4:5]*38.6-31.4)
     dense = np.sign(z)*z*z

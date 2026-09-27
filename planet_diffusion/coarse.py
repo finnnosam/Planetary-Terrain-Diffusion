@@ -8,10 +8,7 @@ VERSION = "completed-coarse-tiles-v1"
 
 
 def linear_weight_window(size=TILE_SIZE):
-    # Exact upstream formula (including the epsilon throughout the ramp).
-    mid = (size-1)/2
-    w = 1-(1-1e-3)*np.clip(np.abs(np.arange(size,dtype=np.float32)-mid)/mid,0,1)
-    return w[:,None]*w[None,:]
+    return cube.linear_weight_window(size)
 
 
 def sample_coarse(backend, seed, raw_guide, steps=20, progress=print, record=None):

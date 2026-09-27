@@ -110,13 +110,25 @@ def conditioning(seed, n, frequency_mult=None, drop_water_pct=.5, raw=False):
     return values if raw else identify(procedural.encode(procedural.finalize(values)))
 
 
+def linear_weight_window(size):
+    """WorldPipeline's float32 linear ramp, including epsilon throughout."""
+    mid = (size-1)/2
+    w = 1-(1-1e-3)*np.clip(np.abs(np.arange(size,dtype=np.float32)-mid)/mid,0,1)
+    return w[:,None]*w[None,:]
+
+
+def tile_positions(n, size, stride, include_endpoint=False):
+    """All stride-aligned tiles intersecting the requested node interval."""
+    return range(-((size-1)//stride)*stride,n+int(include_endpoint),stride)
+
+
 def consensus(a, predict, size, stride, progress=None, batch_size=1, predict_batch=None,
-              weight_window=None, shared_weights=False):
+              weight_window=None, shared_weights=False, include_endpoint=False):
     """Blend in stable patch order, optionally evaluating bounded groups together."""
     if isinstance(batch_size, bool) or not isinstance(batch_size, (int, np.integer)) or batch_size < 1:
         raise ValueError("batch_size must be a positive integer")
     n = a.shape[-1]-1
-    positions = list(range(-stride,n,stride))
+    positions = list(tile_positions(n,size,stride,include_endpoint))
     w1 = np.maximum(1e-3, 1-np.abs(np.linspace(-1,1,size)))
     weight = w1[:,None]*w1[None,:]
     if weight_window is not None:
