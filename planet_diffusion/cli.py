@@ -5,6 +5,22 @@ import sys
 from .storage import load_state, save_state, export_tiff, verify_state, load_climate
 
 
+def confirm_region(bounds, width, height, n, allowed=False):
+    from .region import estimate_decoder_patches
+    count = estimate_decoder_patches(bounds,width,height,n,stop_after=100000)
+    if count <= 2000:
+        print(f"Regional decoder estimate: about {count:,} unique patches",file=sys.stderr,flush=True)
+        return
+    amount = f"about {count:,}" if count <= 100000 else "more than 100,000"
+    print(f"Regional decoder estimate: {amount} unique patches",file=sys.stderr,flush=True)
+    if allowed:
+        return
+    if not sys.stdin.isatty():
+        raise ValueError("Large regional generation requires --allow-large-region in non-interactive use")
+    if input("Generate this large region? [y/N] ").strip().lower() not in ("y","yes"):
+        raise ValueError("Regional generation cancelled")
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Generate spherical elevation with Terrain Diffusion")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -21,6 +37,7 @@ def main(argv=None):
     gen.add_argument("--draft-refinement", type=float, default=.2, help="Upstream conditioning noise, 0.01..4; smaller follows guide more closely (default .2)")
     gen.add_argument("--coarse-height", type=int, help="Logical guide height, multiple of 4; regional default 1024 (90 m) or 2560 (30 m)")
     gen.add_argument("--regional-only", action="store_true", help="Use sparse fixed-grid guides; requires --bounds")
+    gen.add_argument("--allow-large-region", action="store_true", help="Allow a region estimated above 2,000 decoder patches")
     gen.add_argument("--coarse-steps", type=int, default=20)
     gen.add_argument("--latent-batch-size", type=int, default=1,
                      help="Cube latent patches per model call; larger batches use more memory (default: 1)")
@@ -52,6 +69,7 @@ def main(argv=None):
     query.add_argument("--bounds", nargs=4, required=True, type=float, metavar=("WEST","SOUTH","EAST","NORTH"))
     query.add_argument("--width", required=True, type=int)
     query.add_argument("--height", required=True, type=int)
+    query.add_argument("--allow-large-region", action="store_true", help="Allow a region estimated above 2,000 decoder patches")
     query.add_argument("--output", required=True)
     query.add_argument("--climate-output", help="Also export five-band climate from the saved state")
     query.add_argument("--upstream", default="upstream")
@@ -76,6 +94,9 @@ def main(argv=None):
             from .query import load_query, query_region
             if Path(args.output).exists():
                 raise ValueError("Output path must not already exist")
+            saved = json.loads((Path(args.state)/"planet.json").read_text(encoding="utf-8"))
+            confirm_region(args.bounds,args.width,args.height,saved["face_native_intervals"],
+                           args.allow_large_region)
             directory, identity, _, _, _ = load_query(args.state,args.checkpoint_dir,
                                                        with_climate=bool(args.climate_output))
             if identity.get("backend") == DiagnosticBackend.name:
@@ -127,6 +148,8 @@ def main(argv=None):
                     raise ValueError("Regional generation requires cube geometry, --width and --height")
                 bounds = validate_region(args.bounds,args.width,args.height,native)
                 region = (args.bounds,args.width,args.height)
+                confirm_region(bounds,args.width,args.height,args.coarse_height*128,
+                               args.allow_large_region)
             elif args.width is not None:
                 raise ValueError("--width requires --bounds")
             elif not 2 <= height <= native:

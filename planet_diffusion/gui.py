@@ -15,6 +15,7 @@ from .model_presets import MODEL_30M, MODEL_90M, default_revision, local_checkpo
 from .seeds import resolve_seed
 
 ROOT = Path(__file__).resolve().parents[1]
+PATCH_CONFIRMATION_THRESHOLD = 2000
 
 
 def configure_tk():
@@ -303,25 +304,36 @@ class Launcher:
         try:
             if not self.folder.get().strip():
                 raise ValueError("Choose a run folder")
+            bounds = [float(v.get()) for v in self.bounds] if self.scope.get() != "Whole globe" else None
+            width, height = int(self.export_width.get()), int(self.export_height.get())
             if self.scope.get() == "Saved run query":
                 command,folder,output = build_query_command(
-                    self.folder.get(),[float(v.get()) for v in self.bounds],
-                    int(self.export_width.get()),int(self.export_height.get()),
+                    self.folder.get(),bounds,width,height,
                     export_climate=self.export_climate.get())
+                state = Path(command[command.index("--state")+1])
+                metadata = json.loads((state/"planet.json").read_text(encoding="utf-8"))
+                if not self.confirm_patch_count(bounds,width,height,metadata["face_native_intervals"]):
+                    return
+                command.append("--allow-large-region")
                 self.append(f"\nQuerying saved run: {folder}\nOutput: {output}\n")
                 self._launch(command,folder,"query",f"query-{output.stem}.log")
                 return
             command,seed,folder = build_command(self.folder.get(),self.seed.get(),self.draft.get(),
                 int(self.coarse_height.get()),float(self.ocean.get()),float(self.white.get()),self.device.get(),
                 float(self.refinement.get()),float(self.radius_metres.get()),
-                int(self.export_height.get()),
-                bounds=[float(v.get()) for v in self.bounds] if self.scope.get() == "Region" else None,
-                export_width=int(self.export_width.get()),latent_batch_size=int(self.latent_batch_size.get()),
+                height,
+                bounds=bounds if self.scope.get() == "Region" else None,
+                export_width=width,latent_batch_size=int(self.latent_batch_size.get()),
                 export_climate=self.export_climate.get(),
                 conditioning_dir=self.conditioning_dir.get(),
                 conditioning_snr=self.refinement.get()+","+self.climate_refinement.get(),
                 regional_only=self.regional_only.get() and self.scope.get() == "Region",
                 model_choice=self.model.get())
+            if bounds is not None and not self.confirm_patch_count(
+                    bounds,width,height,int(self.coarse_height.get())*128):
+                return
+            if bounds is not None:
+                command.append("--allow-large-region")
             folder.mkdir(parents=True,exist_ok=True)
             self.seed.set(str(seed))
             self.append(f"\nSeed: {seed}\nRun folder: {folder}\n")
@@ -329,6 +341,24 @@ class Launcher:
             self._launch(command,folder,"generation","generation.log",seed=seed)
         except (OSError,ValueError) as exc:
             messagebox.showerror("Cannot start task",str(exc)); return
+
+    def confirm_patch_count(self,bounds,width,height,n):
+        from .region import estimate_decoder_patches
+        count = estimate_decoder_patches(bounds,width,height,n,
+                                         stop_after=100000)
+        if count > PATCH_CONFIRMATION_THRESHOLD:
+            amount = f"about {count:,}" if count <= 100000 else "more than 100,000"
+            approved = messagebox.askyesno(
+                "Large regional generation",
+                f"This crop is estimated to need {amount} unique decoder patches "
+                f"at the selected resolution. Generate it anyway?")
+            if not approved:
+                self.append("Regional generation cancelled before starting.\n")
+                return False
+            self.append(f"Regional decoder estimate: {amount} unique patches.\n")
+        else:
+            self.append(f"Regional decoder estimate: about {count:,} unique patches.\n")
+        return True
 
     def _launch(self,command,folder,kind,log_name,seed=None):
         self.process = subprocess.Popen(command,cwd=ROOT,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,

@@ -49,6 +49,7 @@ Use `.venv\Scripts\python.exe -m planet_diffusion COMMAND`. Paths below are rela
 | `--snr E,T,TS,P,PCV` | TIFF refinement for the five channels in the order below, each `0.01–4` (default `0.2,0.2,1,0.2,1`); smaller follows input more closely. Requires `--conditioning-dir`. |
 | `--coarse-height N` | Logical guide height in cells, multiple of 4; default `8`, or `1024` for regional-only 90 m / `2560` for regional-only 30 m. Native output height is `N × 256` pixels. |
 | `--regional-only` | Compute only the requested region; requires `--bounds`. |
+| `--allow-large-region` | Proceed when the regional decoder estimate exceeds 2,000 patches; useful for unattended runs. |
 | `--bounds W S E N` | Regional west/south/east/north in longitude/latitude degrees. West/east: `−180–180`; south/north: `−90–90`. East less than west crosses the date line. Requires `--width` and `--height`. |
 | `--width PX`, `--height PX` | Regional output dimensions in pixels. Without bounds, `--height` selects global output height (default native); global width is twice height. |
 | `--radius-metres M` | Sphere radius in metres (default `6371000`). |
@@ -65,6 +66,7 @@ Use `.venv\Scripts\python.exe -m planet_diffusion COMMAND`. Paths below are rela
 | `--geometry cube\|equirectangular` | Geometry (default `cube`); `equirectangular` is legacy and does not support PNG/TIFF conditioning or climate export. |
 
 `--regional-only` is the practical choice when only a small area is needed. The 30 m and 90 m models need separate run folders. A requested regional pixel density cannot exceed the native density set by `--coarse-height`.
+Regional generation and `query` estimate unique decoder patches before starting the model. Above 2,000, the desktop launcher asks for confirmation; the CLI prompts in a terminal or requires `--allow-large-region` when unattended. The estimate includes reconstruction halos; the final logged patch count may differ.
 
 ### `export` and `query` options
 

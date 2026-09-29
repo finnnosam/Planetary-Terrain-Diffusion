@@ -35,6 +35,43 @@ def validate_region(bounds, width, height, native_height=None):
     return [west, south, east, north]
 
 
+def estimate_decoder_patches(bounds, width, height, n, stop_after=None):
+    """Conservative decoder patch estimate for a regional pixel-centre grid.
+
+    Reconstruction reads a halo beyond each output pixel. Sample the spherical
+    crop more finely than a decoder stride, and include a 384-node halo on all
+    cube charts touched by that neighborhood. The wide halo intentionally
+    favors overestimating; actual use is logged by generate_region.
+    """
+    west, south, east, north = validate_region(bounds, width, height)
+    stride = DECODER_STRIDE
+    # A 64-node angular step leaves room for distortion near cube face edges.
+    columns = min(width, max(2, math.ceil(math.radians(east-west)*n/64)+1))
+    rows = min(height, max(2, math.ceil(math.radians(north-south)*n/64)+1))
+    lon = np.deg2rad(west+(np.linspace(.5,width-.5,columns))*(east-west)/width)
+    lat = np.deg2rad(north-(np.linspace(.5,height-.5,rows))*(north-south)/height)
+    seen = set()
+    dy, dx = np.meshgrid((-384, 0, 384),(-384, 0, 384),indexing="ij")
+    dy, dx = dy.ravel()[:,None], dx.ravel()[:,None]
+    for latitude in lat:
+        p = np.stack((np.cos(latitude)*np.cos(lon),
+                      np.cos(latitude)*np.sin(lon),
+                      np.full(columns,np.sin(latitude))),axis=-1)
+        face, y, x = cube.coordinates(p,n)
+        direction = cube.directions(face[None,:],y[None,:]+dy,x[None,:]+dx,
+                                    n,normalize=False)
+        other, oy, ox = cube.coordinates(direction,n)
+        by, bx = np.floor(oy/stride).astype(int), np.floor(ox/stride).astype(int)
+        for y_offset in (-1,0):
+            for x_offset in (-1,0):
+                py, px = by+y_offset, bx+x_offset
+                valid = (py*stride <= n) & (px*stride <= n)
+                seen.update(zip(other[valid].ravel(),py[valid].ravel(),px[valid].ravel()))
+        if stop_after is not None and len(seen) > stop_after:
+            return len(seen)
+    return len(seen)
+
+
 class Field:
     """Lazy scalar shared-node field; weighted raw() returns (sum, weight).
 
