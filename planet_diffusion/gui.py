@@ -1,5 +1,6 @@
 """Desktop launcher with a reusable, cancellable model worker."""
 from datetime import datetime
+import argparse
 import json
 import math
 import os
@@ -16,6 +17,83 @@ from .seeds import resolve_seed
 
 ROOT = Path(__file__).resolve().parents[1]
 PATCH_CONFIRMATION_THRESHOLD = 2000
+
+
+def load_launch_settings(path):
+    """Read saved launcher arguments as data, without executing the command."""
+    path = Path(path).expanduser().resolve()
+    saved = json.loads(path.read_text(encoding="utf-8-sig"))
+    command = saved.get("command") if isinstance(saved,dict) else None
+    if (not isinstance(command,list) or not command
+            or not all(isinstance(value,str) for value in command)):
+        raise ValueError("launch.json must contain a command list of strings")
+    if command[:1] == ['generate']:
+        argv = command[1:]
+    else:
+        try:
+            index = command.index('planet_diffusion')
+        except ValueError:
+            raise ValueError("Expected a planet_diffusion generation command") from None
+        if command[index+1:index+2] != ['generate']:
+            raise ValueError("Expected a planet_diffusion generation command")
+        argv = command[index+2:]
+    class SettingsParser(argparse.ArgumentParser):
+        def error(self,message):
+            raise ValueError(f"Invalid saved launch command: {message}")
+    parser = SettingsParser(add_help=False)
+    for option in ('state','output','checkpoint-dir','draft','conditioning-dir','upstream','revision',
+                   'climate-output'):
+        parser.add_argument('--'+option)
+    parser.add_argument('--seed',default=str(saved.get('seed','random')))
+    parser.add_argument('--model',default=MODEL_90M)
+    parser.add_argument('--device',choices=('auto','cpu','cuda'),default='auto')
+    parser.add_argument('--precision',choices=('auto','float32','tf32','bfloat16'),default='auto')
+    for option,default in (('coarse-height',None),('height',None),('width',None),('latent-batch-size',1)):
+        parser.add_argument('--'+option,type=int,default=default)
+    for option,default in (('radius-metres',6371000.),('draft-black-metres',None),
+                           ('draft-ocean-depth',0.),('draft-white-metres',4000.),('draft-refinement',.2)):
+        parser.add_argument('--'+option,type=float,default=default)
+    parser.add_argument('--bounds',type=float,nargs=4)
+    parser.add_argument('--snr',default='.2,.2,1,.2,1')
+    for option in ('regional-only','preview','allow-large-region'):
+        parser.add_argument('--'+option,action='store_true')
+    # Older or CLI-written launch files may also contain settings without UI controls.
+    for option in ('backend','geometry','coarse-steps','patch-cache-mib','blend-cache-mib','decoder-cache-mib'):
+        parser.add_argument('--'+option)
+    args = parser.parse_args(argv)
+    if args.regional_only and args.bounds is None:
+        raise ValueError("Saved regional-only settings require bounds")
+    def input_path(value):
+        if not value:
+            return ''
+        source = Path(value).expanduser()
+        return str(source if source.is_absolute() else (ROOT/source).resolve())
+    coarse = args.coarse_height or (sparse_guide_height(args.model) if args.regional_only else 16)
+    height = args.height or coarse*256
+    width = args.width or height*2
+    if args.preview and args.bounds is not None:
+        coarse = preview_guide_height(args.bounds,width,height)
+    snr = args.snr.split(',')
+    if len(snr) != 5:
+        raise ValueError("Saved TIFF refinement must contain five comma-separated values")
+    black = args.draft_black_metres
+    if black is None:
+        black = -abs(args.draft_ocean_depth) if args.draft_ocean_depth else -2000.
+    settings = dict(seed=args.seed,folder=str(path.parent),draft=input_path(args.draft),
+                    conditioning_dir=input_path(args.conditioning_dir),coarse_height=str(coarse),
+                    export_width=str(width),export_height=str(height),radius_metres=str(args.radius_metres),
+                    black=str(black),white=str(args.draft_white_metres),
+                    refinement=snr[0] if args.conditioning_dir else str(args.draft_refinement),
+                    climate_refinement=','.join(snr[1:]),device=args.device,precision=args.precision,
+                    model='30 m' if Path(args.model).name == 'terrain-diffusion-30m' else '90 m',
+                    latent_batch_size=str(args.latent_batch_size),export_climate=bool(args.climate_output),
+                    regional_only=args.regional_only,scope='Region' if args.bounds is not None else 'Whole globe',
+                    detail_level='Custom',bounds=[str(v) for v in (args.bounds or (-30,-30,30,30))])
+    settings['warnings'] = [f"--{option.replace('_','-')} {getattr(args,option)}"
+                            for option in ('backend','geometry','coarse_steps','patch_cache_mib',
+                                           'blend_cache_mib','decoder_cache_mib')
+                            if getattr(args,option) is not None]
+    return settings
 
 
 def preview_guide_height(bounds, width, height):
@@ -232,6 +310,8 @@ class Launcher:
         actions.grid(row=21,column=0,columnspan=3,sticky="ew",pady=8)
         self.generate = ttk.Button(actions,text="Generate / Resume",command=self.start)
         self.generate.pack(side="left"); self.controls.append(self.generate)
+        load = ttk.Button(actions,text="Load settings…",command=self.load_settings)
+        load.pack(side="left",padx=8); self.controls.append(load)
         sparse = ttk.Checkbutton(actions,text="Only generate requested region",variable=self.regional_only,
                                 command=self.change_regional_mode)
         sparse.pack(side="left",padx=8); self.controls.append(sparse)
@@ -270,6 +350,33 @@ class Launcher:
     def browse_folder(self):
         path = filedialog.askdirectory(title="Choose a run folder, including a completed run for queries")
         if path: self.folder.set(path)
+
+    def load_settings(self):
+        path = filedialog.askopenfilename(title="Load settings from launch.json",
+            initialdir=self.folder.get() if Path(self.folder.get()).is_dir() else str(ROOT/'outputs'),
+            filetypes=[("Launch settings","*.json")])
+        if not path:
+            return
+        try:
+            settings = load_launch_settings(path)
+        except (OSError,ValueError) as exc:
+            messagebox.showerror("Cannot load settings",str(exc))
+            return
+        for name,value in settings.items():
+            if name not in ('bounds','warnings'):
+                getattr(self,name).set(value)
+        for variable,value in zip(self.bounds,settings['bounds']):
+            variable.set(value)
+        # change_scope also resets dimensions and guide height; loading must preserve them.
+        for widget in self.bound_controls:
+            widget.configure(state='normal' if self.scope.get() == 'Region' else 'disabled')
+        self.generate.configure(text='Generate / Resume')
+        self.status.set(f"Loaded settings from {path}")
+        self.append(f"\nLoaded settings from {path}\n")
+        if settings['warnings']:
+            messagebox.showwarning("Additional command settings",
+                "These saved options have no launcher controls and will use launcher defaults:\n"+
+                '\n'.join(settings['warnings']))
 
     def new_run(self):
         self.folder.set(str(ROOT/"outputs"/("planet-"+datetime.now().strftime("%Y%m%d-%H%M%S-%f"))))
@@ -380,7 +487,7 @@ class Launcher:
             folder.mkdir(parents=True,exist_ok=True)
             self.seed.set(str(seed))
             self.append(f"\nSeed: {seed}\nRun folder: {folder}\n")
-            (folder/"launch.json").write_text(json.dumps({"seed":seed,"command":command},indent=2)+"\n")
+            (folder/"launch.json").write_text(json.dumps({"seed":seed,"command":command},indent=2)+"\n",encoding='utf-8')
             self._launch(command,folder,"generation","generation.log",seed=seed)
         except (OSError,ValueError) as exc:
             messagebox.showerror("Cannot start task",str(exc)); return

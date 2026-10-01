@@ -109,6 +109,8 @@ Elevation output is one float32 band in metres. Climate output bands are tempera
 
 Double-click `Launch Planet.cmd` or run `.venv\Scripts\python.exe -m planet_diffusion gui`. **Generate / Resume** uses the run folder and current settings; **Stop** keeps completed checkpoints. **New run** selects a fresh folder; **Open run folder** opens it. For **Saved run query**, choose a completed run folder or its `state` folder, enter bounds and output dimensions, then click **Query saved run**.
 
+Click **Load settings…** and choose an existing run's `launch.json` to restore its seed, inputs, resolution, bounds, model, and compute settings. The selected file's folder becomes the run folder, and the saved guide height is kept as **Custom**. Loading does not start generation. Click **Generate / Resume** to continue an interrupted run, or **New run** to reuse the settings in a fresh folder. Older launch files are supported; options without launcher controls are listed in a warning and use launcher defaults.
+
 | UI input | Meaning / default |
 |---|---|
 | Draft PNG | Optional global 2:1 PNG, as described above. |
