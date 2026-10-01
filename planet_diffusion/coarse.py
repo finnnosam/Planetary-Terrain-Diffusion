@@ -35,11 +35,7 @@ def sample_coarse(backend, seed, raw_guide, steps=20, progress=print, record=Non
         nonlocal completed
         cond = cube.read(guide,face,np.arange(y,y+TILE_SIZE)[:,None],
                          np.arange(x,x+TILE_SIZE)[None,:],nearest=True)
-        state = noise*backend.start_coarse(steps)
-        for step in range(steps):
-            prediction = backend.coarse_predict(state,cond,step)
-            state = backend.coarse_advance(prediction,state,step)
-        result = backend.coarse_finish(state)*stds[:,None,None]+means[:,None,None]
+        result = backend.sample_coarse_tile(noise,cond,steps)*stds[:,None,None]+means[:,None,None]
         result[1] = result[0]-result[1]
         completed += 1
         progress(f"cube coarse tile {completed}/{patches} ({steps} steps)")

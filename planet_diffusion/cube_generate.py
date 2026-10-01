@@ -14,7 +14,7 @@ from .detail import sample_latents, decoder_conditioning, DECODER_SIZE, DECODER_
 
 def generate_cube(backend, seed, face_coarse=4, coarse_steps=20, progress=print,
                   audit=None, checkpoint_dir=None, draft=None, region=None, latent_batch_size=1,
-                  with_climate=False, conditioning=None):
+                  with_climate=False, conditioning=None, decoder_cache_bytes=64*1024**2):
     """Return elevation/metadata; with_climate adds compact climate features as a third result."""
     if (isinstance(latent_batch_size, bool) or not isinstance(latent_batch_size, (int, np.integer))
             or latent_batch_size < 1):
@@ -151,7 +151,8 @@ def generate_cube(backend, seed, face_coarse=4, coarse_steps=20, progress=print,
         from .region import generate_region
         guide_seconds = time.perf_counter()-guides_started
         progress(f"Regional detail: global guides ready in {guide_seconds:.1f}s; decoding requested cube patches and halos")
-        result, metadata = generate_region(backend,latent,seed,bounds,width,height,metadata,directory,progress)
+        result, metadata = generate_region(backend,latent,seed,bounds,width,height,metadata,directory,progress,
+                                          decoder_cache_bytes=decoder_cache_bytes)
         metadata['regional_execution']['guide_seconds'] = guide_seconds
         return (result, metadata, climate) if with_climate else (result, metadata)
 

@@ -41,13 +41,15 @@ Use `.venv\Scripts\python.exe -m planet_diffusion COMMAND`. Paths below are rela
 | Input | Meaning / default |
 |---|---|
 | `--seed N\|random` | Unsigned 64-bit integer or random seed (default `random`). The chosen seed is saved. |
-| `--draft FILE` | Optional north-up 2:1 global PNG: black is ocean, brighter land is higher, transparency uses procedural terrain. |
-| `--draft-ocean-depth M` | PNG ocean depth hint in metres; `0` selects automatic depth (default). |
-| `--draft-white-metres M` | Elevation of white PNG land in metres (default `4000`). |
+| `--draft FILE` | Optional north-up 2:1 global PNG: brightness maps linearly between black and white elevations; transparency uses procedural terrain. |
+| `--draft-black-metres M` | Signed elevation of black PNG pixels in metres (default `-2000`). Gray values interpolate linearly to white. |
+| `--draft-ocean-depth M` | Compatibility option: positive depth sets black to its negative; `0` uses `-2000`. Cannot combine with `--draft-black-metres`. |
+| `--draft-white-metres M` | Elevation of white PNG pixels in metres (default `4000`). |
 | `--draft-refinement N` | PNG elevation refinement, `0.01–4` (default `0.2`); smaller follows the draft more closely. |
 | `--conditioning-dir DIR` | Folder of global conditioning GeoTIFFs described below; use instead of `--draft`. |
 | `--snr E,T,TS,P,PCV` | TIFF refinement for the five channels in the order below, each `0.01–4` (default `0.2,0.2,1,0.2,1`); smaller follows input more closely. Requires `--conditioning-dir`. |
 | `--coarse-height N` | Logical guide height in cells, multiple of 4; default `8`, or `1024` for regional-only 90 m / `2560` for regional-only 30 m. Native output height is `N × 256` pixels. |
+| `--preview` | With `--regional-only`, choose the smallest guide grid matching regional output pixel density. Omit `--coarse-height`. |
 | `--regional-only` | Compute only the requested region; requires `--bounds`. |
 | `--allow-large-region` | Proceed when the regional decoder estimate exceeds 2,000 patches; useful for unattended runs. |
 | `--bounds W S E N` | Regional west/south/east/north in longitude/latitude degrees. West/east: `−180–180`; south/north: `−90–90`. East less than west crosses the date line. Requires `--width` and `--height`. |
@@ -55,10 +57,12 @@ Use `.venv\Scripts\python.exe -m planet_diffusion COMMAND`. Paths below are rela
 | `--radius-metres M` | Sphere radius in metres (default `6371000`). |
 | `--climate-output FILE` | Also writes five-band climate GeoTIFF; requires cube geometry. |
 | `--coarse-steps N` | Coarse denoising steps (default `20`; minimum `2`). |
-| `--latent-batch-size N` | Latent patches per model call (default `1`); higher values use more memory. Cube geometry only. |
+| `--latent-batch-size N` | Maximum latent patches per model call (default `1`); higher values use more memory. Applies to global and regional-only cube generation; regional batches contain only missing dependencies and may be smaller. Saved queries reuse this setting. |
 | `--model ID\|DIR` | Hugging Face model ID or local model folder (default `xandergos/terrain-diffusion-90m`; `xandergos/terrain-diffusion-30m` is also supported). |
 | `--revision REV` | Model revision; defaults to the pinned revision for the selected model. |
-| `--device cpu\|cuda` | Compute device (default `cpu`). |
+| `--device auto\|cpu\|cuda` | Compute device (default `auto`: CUDA when available, otherwise CPU). |
+| `--precision auto\|float32\|tf32\|bfloat16` | Default `auto`: native CUDA bfloat16 when supported, otherwise float32. Explicit overrides are available. Checkpoints record the resolved mode. |
+| `--patch-cache-mib N`, `--blend-cache-mib N`, `--decoder-cache-mib N` | Retained array budgets per sparse stage / regional decoder (defaults `64`, `8`, `64` MiB). Zero disables retention. Also supported by `query`. |
 | `--threads N` | PyTorch CPU threads (default `4`). |
 | `--upstream DIR` | Pinned Terrain Diffusion source directory (default `upstream`). |
 | `--checkpoint-dir DIR` | Checkpoint directory (default `STATE.checkpoints` for cube runs). |
@@ -67,6 +71,14 @@ Use `.venv\Scripts\python.exe -m planet_diffusion COMMAND`. Paths below are rela
 
 `--regional-only` is the practical choice when only a small area is needed. The 30 m and 90 m models need separate run folders. A requested regional pixel density cannot exceed the native density set by `--coarse-height`.
 Regional generation and `query` estimate unique decoder patches before starting the model. Above 2,000, the desktop launcher asks for confirmation; the CLI prompts in a terminal or requires `--allow-large-region` when unattended. The estimate includes reconstruction halos; the final logged patch count may differ.
+
+Reducing export dimensions alone keeps the native generation grid. Use `--preview` or the desktop **Preview** level to lower that grid as well. A 4° × 4° region at 512 × 512 pixels uses guide height 92 in Preview, rather than 1024 for full 90 m detail. Preview changes the terrain realization; use separate run folders for Preview, Full detail, and different precision modes. Saved queries always retain their run's grid and precision.
+
+Models load only when an uncached dependency needs inference. Fully cached queries validate the saved identities and export without loading weights. The desktop worker retains loaded model stages between compatible jobs, reuses unchanged local weight hashes, and restarts when source code changes. Stop terminates the worker and preserves completed predictions; the next job starts a new worker.
+
+Precision Auto uses a fixed hardware rule: native bfloat16 on compatible CUDA GPUs, float32 on CPU and other GPUs. It does not retune from fluctuating timings, so repeated Auto generations on the same hardware use the same mode. Saved queries explicitly reuse their recorded mode. Numerical differences from earlier versions or other precision modes are allowed; independent current-code generations with identical seed/settings must match.
+
+On an RTX 3070, a measured 90 m crop (seed 42, 20 coarse steps, 8 × 8 output) was bitwise repeatable across two independent generations in all modes. TF32 had no measured speed gain; bfloat16 improved decoder time by about 20%. Differences from float32 do not establish quality degradation and are not a reason to exclude a repeatable faster mode. The policy reflects these measurements and native hardware support, rather than a guarantee of the fastest mode for every workload/GPU. Run `python tools/profile_performance.py --mode all` to reproduce cache/filtering/precision comparisons, or `--mode auto` to check fresh Auto generations and lazy cached replay; `--model models/terrain-diffusion-30m` selects the 30 m checkpoint.
 
 ### `export` and `query` options
 
@@ -80,6 +92,8 @@ Regional generation and `query` estimate unique decoder patches before starting 
 | `query` | `--upstream DIR` | Pinned source directory (default `upstream`). |
 
 `query` uses the same longitude/latitude bounds and pixel dimensions as regional `generate`. `export` reproduces a regional state's saved grid; it cannot export areas outside that state.
+
+PNG elevations use `black + brightness × (white − black)`, with brightness from 0 to 1. Both endpoints must be finite, and white must be greater than black. For black `-6000` and white `6000`, midpoint gray is sea level. This replaces the previous special treatment of black; use a new run folder for new generations. Saved queries retain their original mapping. TIFF inputs remain literal elevations in metres.
 
 ### Conditioning TIFF inputs and output units
 
@@ -106,14 +120,14 @@ Double-click `Launch Planet.cmd` or run `.venv\Scripts\python.exe -m planet_diff
 | Seed / Random | Unsigned 64-bit integer or random seed (default random). |
 | Run folder | Folder for saved state, checkpoints, log, and GeoTIFFs. |
 | Export climate maps | Also save `planet-climate.tif` (off by default). |
-| Logical guide height | Cells, multiple of 4 (default `16` globally; `1024` or `2560` when switching to regional-only 90 m or 30 m). |
+| Logical guide height / detail level | Cells, multiple of 4. Global default `16`; regional **Preview** chooses a grid matching output density. **Full detail** uses `1024` or `2560` for 90 m or 30 m. Editing the guide height selects **Custom**. |
 | Radius | Metres (default `6371000`). |
 | Output resolution | Width and height in pixels (default `8192 × 4096` globally; `512 × 512` when switching to a region). Global width must be twice height. |
-| Ocean depth hint | PNG ocean depth in metres; `0` means automatic (default). |
-| White land elevation | Elevation of white PNG land in metres (default `6250`). |
+| Black elevation | Signed elevation of black PNG pixels in metres (default `-2000`). |
+| White elevation | Elevation of white PNG pixels in metres (default `6250`). |
 | Elevation refinement | PNG or TIFF elevation refinement, `0.01–4` (default `0.2`); smaller follows input more closely. |
 | TIFF climate refinement | Four values for temperature, temperature standard deviation, precipitation, precipitation variation (default `0.2,1,0.2,1`); each `0.01–4`. |
-| Compute device | `cpu` (default) or `cuda`. |
+| Compute device / precision | Both default to `auto`: CUDA when available, with native bfloat16 when supported. Explicit device and precision overrides remain available. |
 | Terrain model | `90 m` (default) or `30 m`. |
 | Latent batch size | Positive number of patches per model call (default `1`); higher values use more memory. |
 | Generation area / saved query | `Whole globe` (default), `Region`, or `Saved run query`. |

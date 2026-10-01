@@ -9,9 +9,9 @@ from pathlib import Path
 import numpy as np
 
 from . import cube, procedural
-from .cache import PredictionCache
+from .cache import ArrayCache, PredictionCache
 from .climate import local_baseline
-from .region import Field, generate_region
+from .region import Field, generate_region, _coordinate_groups
 
 VERSION = "sparse-cube-v1"
 
@@ -25,10 +25,39 @@ class Channels:
                        for c in range(channels)]
 
     def read(self, f, y, x, nearest=False):
-        return np.stack([field.read(f,y,x,nearest) for field in self.fields])
+        y,x = np.broadcast_arrays(y,x)
+        if y.min() < 0 or x.min() < 0 or y.max() > self.n or x.max() > self.n:
+            return self.sample(cube.directions(f,y,x,self.n,normalize=False),nearest)
+        return self.indices(f,y,x,nearest)
 
     def sample(self, p, nearest=False):
-        return np.stack([field.sample(p,nearest) for field in self.fields])
+        return self.indices(*cube.coordinates(p,self.n),nearest)
+
+    def nodes(self, f, y, x):
+        f,y,x = np.broadcast_arrays(f,y,x)
+        shape = y.shape
+        f,y,x = f.ravel(),y.ravel(),x.ravel()
+        tile = self.fields[0].tile
+        tiles = self.n//tile+1
+        result = np.empty((len(self.fields),len(y)),np.float32)
+        for key,use in _coordinate_groups((f*tiles+y//tile)*tiles+x//tile):
+            face,remainder = divmod(key,tiles*tiles)
+            ty,tx = divmod(remainder,tiles)
+            dy,dx = y[use]%tile,x[use]%tile
+            for channel,field in enumerate(self.fields):
+                result[channel,use] = field.block(face,ty,tx)[dy,dx]
+        return result.reshape((len(self.fields),*shape))
+
+    def indices(self, f, y, x, nearest=False):
+        if nearest:
+            return self.nodes(f,np.floor(y+.5).astype(int),np.floor(x+.5).astype(int))
+        iy,ix = np.floor(y).astype(int),np.floor(x).astype(int)
+        if np.array_equal(y,iy) and np.array_equal(x,ix):
+            return self.nodes(f,iy,ix)
+        jy,jx = np.minimum(iy+1,self.n),np.minimum(ix+1,self.n)
+        fy,fx = y-iy,x-ix
+        return ((1-fy)*((1-fx)*self.nodes(f,iy,ix)+fx*self.nodes(f,iy,jx))
+                +fy*((1-fx)*self.nodes(f,jy,ix)+fx*self.nodes(f,jy,jx))).astype(np.float32)
 
     def channel(self, index):
         return self.fields[index]
@@ -86,7 +115,10 @@ class Guide(Channels):
 class Stage(Channels):
     """Completed model tiles blended at nodes, including other face owners."""
     def __init__(self, directory, identity, name, n, channels, size, stride,
-                 calculate, *, include_endpoint=False):
+                 calculate, *, include_endpoint=False, tile=32, calculate_batch=None, batch_size=1,
+                 patch_cache_bytes=64*1024**2, blend_cache_bytes=8*1024**2):
+        self.patch_memory = ArrayCache(patch_cache_bytes)
+        self.blend_memory = ArrayCache(blend_cache_bytes)
         self.identity = {"generation":identity,"stage":name}
         self.size,self.stride,self.include_endpoint = size,stride,include_endpoint
         self.weight = cube.linear_weight_window(size)
@@ -95,33 +127,112 @@ class Stage(Channels):
         self.cache = PredictionCache(directory/name,self.identity,
                                      lambda _,f,y,x:calculate(f,y,x))
 
-        @lru_cache(maxsize=48)
-        def patch(f,y,x):
-            return self.cache.get_or_compute(lambda:None,(channels,size,size),f,y,x)
-        self.patch = patch
+        memory = self.patch_memory
+        shape = (channels,size,size)
+
+        def patches(locations):
+            values, missing = {}, []
+            for location in locations:
+                value = memory.get(location)
+                if value is not None:
+                    values[location] = value
+                else:
+                    value = self.cache.load(shape,*location)
+                    if value is None:
+                        missing.append(location)
+                    else:
+                        values[location] = value
+            # Only batch dependencies of this read; never generate speculative tiles.
+            for start in range(0,len(missing),batch_size):
+                batch = missing[start:start+batch_size]
+                predicted = (calculate_batch(batch) if calculate_batch is not None else
+                             np.stack([calculate(*location) for location in batch]))
+                if np.shape(predicted) != (len(batch),*shape):
+                    raise ValueError(f"Invalid sparse {name} batch shape")
+                for location,value in zip(batch,predicted):
+                    values[location] = self.cache.save(value,shape,*location)
+            for location in locations:
+                memory.put(location, values[location])
+            return values
+
+        self.patch = lambda f,y,x: patches([(f,y,x)])[(f,y,x)]
 
         def raw(channel,face,y,x):
+            # Field views ask for identical blocks/edge coordinates across
+            # channels. Keep the shared weighted sums, including the norm, so
+            # each view still performs the original shared-node consensus.
+            key = (face,y.shape,y.dtype.str,y.tobytes(),x.shape,x.dtype.str,x.tobytes())
+            blend = self.blend_memory.get(key)
+            if blend is None:
+                blend = blend_nodes(face,y,x)
+                self.blend_memory.put(key,blend)
+            return blend[channel],blend[-1]
+
+        def dependencies(face,y,x):
             y,x = np.broadcast_arrays(y,x)
-            total = np.zeros(y.shape,np.float64)
-            norm = np.zeros(y.shape,np.float64)
             first_y = max(self.minimum,-((size-1-int(y.min()))//stride)*stride)
             first_x = max(self.minimum,-((size-1-int(x.min()))//stride)*stride)
             last_y = min(self.maximum,(int(y.max())//stride)*stride)
             last_x = min(self.maximum,(int(x.max())//stride)*stride)
+            locations = []
             for py in range(first_y,last_y+1,stride):
                 for px in range(first_x,last_x+1,stride):
                     use = (y>=py)&(y<py+size)&(x>=px)&(x<px+size)
-                    if not use.any():
-                        continue
-                    dy,dx = y[use]-py,x[use]-px
-                    weight = self.weight[dy,dx]
-                    total[use] += patch(face,py,px)[channel,dy,dx]*weight
-                    norm[use] += weight
+                    if use.any():
+                        locations.append((face,py,px))
+            return locations
+
+        def blend_nodes(face,y,x):
+            y,x = np.broadcast_arrays(y,x)
+            blend = np.zeros((channels+1,*y.shape),np.float64)
+            total, norm = blend[:-1], blend[-1]
+            locations = dependencies(face,y,x)
+            values = patches(locations)
+            for location in locations:
+                _,py,px = location
+                use = (y>=py)&(y<py+size)&(x>=px)&(x<px+size)
+                dy,dx = y[use]-py,x[use]-px
+                weight = self.weight[dy,dx]
+                total[:,use] += values[location][:,dy,dx]*weight
+                norm[use] += weight
             if (norm == 0).any():
                 raise RuntimeError(f"Incomplete sparse {name} tile coverage")
-            return total,norm
+            return blend
 
-        super().__init__(n,channels,raw,weighted=True,tile=32)
+        def prepare_reads(requests):
+            """Batch exact block and shared-edge dependencies of nearest reads."""
+            needed = dict()
+            blocks = set()
+            tiles = n//tile+1
+            for face,y,x in requests:
+                y,x = np.broadcast_arrays(y,x)
+                if y.min() < 0 or x.min() < 0 or y.max() > n or x.max() > n:
+                    face,y,x = cube.coordinates(cube.directions(face,y,x,n,normalize=False),n)
+                face,y,x = np.broadcast_arrays(face,np.floor(y+.5).astype(int),np.floor(x+.5).astype(int))
+                for key,_ in _coordinate_groups((face*tiles+y//tile)*tiles+x//tile):
+                    if key in blocks:
+                        continue
+                    blocks.add(key)
+                    f,remainder = divmod(key,tiles*tiles)
+                    ty,tx = divmod(remainder,tiles)
+                    yy = np.arange(ty*tile,min((ty+1)*tile,n+1))[:,None]
+                    xx = np.arange(tx*tile,min((tx+1)*tile,n+1))[None,:]
+                    needed.update(dict.fromkeys(dependencies(f,yy,xx)))
+                    by,bx = np.broadcast_arrays(yy,xx)
+                    edge = (by==0)|(by==n)|(bx==0)|(bx==n)
+                    if edge.any():
+                        p = cube.directions(f,by[edge],bx[edge],n,normalize=False)
+                        for other in range(6):
+                            use = np.isclose(p@cube.NORMAL[other],1,atol=1e-12,rtol=0)
+                            if use.any():
+                                oy = np.rint(n*(1+p[use]@cube.DOWN[other])/2).astype(int)
+                                ox = np.rint(n*(1+p[use]@cube.RIGHT[other])/2).astype(int)
+                                needed.update(dict.fromkeys(dependencies(other,oy,ox)))
+            patches(list(needed))
+
+        self.prepare_reads = prepare_reads
+
+        super().__init__(n,channels,raw,weighted=True,tile=tile)
 
 
 class SparseClimate(Channels):
@@ -158,9 +269,16 @@ class SparseClimate(Channels):
 
 class SparseWorld:
     def __init__(self, backend, seed, guide_height, coarse_steps, radius_metres,
-                 checkpoint_dir, source=None, identity=None):
+                 checkpoint_dir, source=None, identity=None, latent_batch_size=1,
+                 patch_cache_bytes=64*1024**2, blend_cache_bytes=8*1024**2,
+                 decoder_cache_bytes=64*1024**2):
+        self.decoder_cache_bytes = decoder_cache_bytes
+        budgets = dict(patch_cache_bytes=patch_cache_bytes,blend_cache_bytes=blend_cache_bytes)
         if guide_height < 4 or guide_height % 4 or coarse_steps < 2:
             raise ValueError("Sparse guide height must be divisible by four and >= 4")
+        if (isinstance(latent_batch_size,bool) or not isinstance(latent_batch_size,(int,np.integer))
+                or latent_batch_size < 1):
+            raise ValueError("latent_batch_size must be a positive integer")
         if source is not None:
             backend = copy.copy(backend)
             backend.cond_snr = (source.cond_snr.copy() if hasattr(source,"cond_snr")
@@ -179,6 +297,7 @@ class SparseWorld:
             digest.update((procedural.DATA/name).read_bytes())
         metadata = {**backend.metadata,"algorithm":VERSION,"seed":seed,
                     "coarse_steps":coarse_steps,"coarse_height":guide_height,
+                    "latent_batch_size":int(latent_batch_size),
                     "face_coarse_intervals":self.n,"face_native_intervals":self.n*256,
                     "native_height":guide_height*256,"radius_metres":radius_metres,
                     "units":"m","source_sha256":digest.hexdigest(),
@@ -211,12 +330,18 @@ class SparseWorld:
         self.guide = Guide(seed,n,source,frequency,drop_water)
         self.noises = {stream:Noise(seed,stream,channels,size) for stream,channels,size in
                        ((0,5,n),(1,6,n),(5819,5,n*32),(5820,5,n*32))}
+        # Latent conditioning needs 4x4 cells. A 32-cell sampling block can
+        # trigger unrelated 64-cell coarse trajectories (20 model calls each).
         self.coarse = Stage(self.directory,metadata,"sparse-coarse",n,6,64,48,
-                            self._coarse_tile)
+                            self._coarse_tile,tile=4,**budgets)
         self.latent_first = Stage(self.directory,metadata,"sparse-latent-0",n*32,5,64,32,
-                                  lambda f,y,x:self._latent_tile(0,f,y,x),include_endpoint=True)
+                                  lambda f,y,x:self._latent_tiles(0,[(f,y,x)])[0],include_endpoint=True,
+                                  calculate_batch=lambda locations:self._latent_tiles(0,locations),
+                                  batch_size=latent_batch_size,**budgets)
         self.latent = Stage(self.directory,metadata,"sparse-latent-1",n*32,5,64,32,
-                            lambda f,y,x:self._latent_tile(1,f,y,x),include_endpoint=True)
+                            lambda f,y,x:self._latent_tiles(1,[(f,y,x)])[0],include_endpoint=True,
+                            calculate_batch=lambda locations:self._latent_tiles(1,locations),
+                            batch_size=latent_batch_size,**budgets)
         self.climate = SparseClimate(self.coarse)
 
     def _coarse_tile(self,face,y,x):
@@ -227,26 +352,30 @@ class SparseWorld:
         scaled = (raw-b.means[channels,None,None])/b.stds[channels,None,None]
         angles = np.arctan(b.cond_snr)[:,None,None]
         cond = (np.cos(angles)*scaled+np.sin(angles)*self.noises[0].read(face,yy,xx,nearest=True)).astype(np.float32)
-        state = self.noises[1].read(face,yy,xx,nearest=True)*b.start_coarse(self.steps)
-        for step in range(self.steps):
-            prediction = b.coarse_predict(state,cond,step)
-            state = b.coarse_advance(prediction,state,step)
-        result = b.coarse_finish(state)*b.stds[:,None,None]+b.means[:,None,None]
+        noise = self.noises[1].read(face,yy,xx,nearest=True)
+        result = b.sample_coarse_tile(noise,cond,self.steps)*b.stds[:,None,None]+b.means[:,None,None]
         result[1] = result[0]-result[1]
         return result.astype(np.float32)
 
-    def _latent_tile(self,step,face,y,x):
+    def _latent_tiles(self,step,locations):
         t = float(np.arctan(160 if step == 0 else .7))
-        yy,xx = np.arange(y,y+64)[:,None],np.arange(x,x+64)[None,:]
-        previous = (0 if step == 0 else self.latent_first.read(face,yy,xx,nearest=True))
-        innovation = self.noises[5819+step].read(face,yy,xx,nearest=True)
-        xt = (np.cos(t)*previous+np.sin(t)*innovation).astype(np.float32)
-        cy,cx = y/32-1+np.arange(4),x/32-1+np.arange(4)
-        cond = self.coarse.read(face,cy[:,None],cx[None,:])
-        prediction = self.backend.predict("latent",xt,cond,t)
+        if step == 1 and len(locations) > 1:
+            self.latent_first.prepare_reads([(face,np.arange(y,y+64)[:,None],np.arange(x,x+64)[None,:])
+                                             for face,y,x in locations])
+        samples,conditions = [],[]
+        for face,y,x in locations:
+            yy,xx = np.arange(y,y+64)[:,None],np.arange(x,x+64)[None,:]
+            previous = (0 if step == 0 else self.latent_first.read(face,yy,xx,nearest=True))
+            innovation = self.noises[5819+step].read(face,yy,xx,nearest=True)
+            samples.append((np.cos(t)*previous+np.sin(t)*innovation).astype(np.float32))
+            cy,cx = y/32-1+np.arange(4),x/32-1+np.arange(4)
+            conditions.append(self.coarse.read(face,cy[:,None],cx[None,:]))
+        xt,cond = np.stack(samples),np.stack(conditions)
+        prediction = self.backend.predict_batch("latent",xt,cond,t)
         return (np.cos(t)*xt+np.sin(t)*prediction).astype(np.float32)
 
     def region(self,bounds,width,height,with_climate=False,progress=print):
         elevation,metadata = generate_region(self.backend,self.latent,self.seed,
-            bounds,width,height,self.metadata,self.directory,progress)
+            bounds,width,height,self.metadata,self.directory,progress,
+            decoder_cache_bytes=self.decoder_cache_bytes)
         return elevation,metadata,(self.climate if with_climate else None)

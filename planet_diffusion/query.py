@@ -73,7 +73,21 @@ def load_query(state, checkpoint_dir=None, with_climate=False):
 def query_region(backend, state, bounds, width, height, checkpoint_dir=None,
                  with_climate=False, progress=print):
     """Decode requested bounds using saved global guides and persistent tile cache."""
-    directory, identity, saved, latent, climate = load_query(state, checkpoint_dir, with_climate)
+    loaded = load_query(state, checkpoint_dir, with_climate)
+    return query_loaded_region(backend, loaded, bounds, width, height,
+                               with_climate=with_climate, progress=progress)
+
+
+def query_loaded_region(backend, loaded, bounds, width, height,
+                        with_climate=False, progress=print, cache_budgets=None):
+    """Decode using the validated guides returned by load_query.
+
+    Callers selecting a backend from the saved identity can reuse their initial
+    load rather than remapping and scanning the full latent guide again.
+    """
+    directory, identity, saved, latent, climate = loaded
+    if backend.metadata.get('precision','float32') != identity.get('precision','float32'):
+        raise ValueError('Backend precision does not match the saved runtime identity')
     if any(backend.metadata.get(key) != value for key, value in identity.items()
            if key in backend.metadata):
         raise ValueError("Backend does not match the saved model and runtime identity")
@@ -84,15 +98,15 @@ def query_region(backend, state, bounds, width, height, checkpoint_dir=None,
         if "draft" in identity:
             from .draft import Draft
             info = identity["draft"]
-            source = Draft(directory/"draft.png",info["ocean_depth_hint_metres"],
-                           info["white_metres"],info["refinement"])
+            source = Draft.from_metadata(directory/"draft.png",info)
         elif "conditioning_tiffs" in identity:
             from .conditioning import TiffConditioning
             source = TiffConditioning(directory/"conditioning",
                                       identity["conditioning_tiffs"]["snr"])
         world = SparseWorld(backend,saved["seed"],saved["coarse_height"],
                             saved["coarse_steps"],saved["radius_metres"],directory,
-                            source=source,identity=identity)
+                            source=source,identity=identity,
+                            latent_batch_size=identity.get("latent_batch_size",1), **(cache_budgets or {}))
         return world.region(bounds,width,height,with_climate=with_climate,progress=progress)
     metadata = dict(identity)
     metadata["algorithm"] = "cubed-sphere-regional-v1"
@@ -102,6 +116,7 @@ def query_region(backend, state, bounds, width, height, checkpoint_dir=None,
         metadata["regional_source_sha256"] = hashlib.sha256(
             Path(__file__).with_name("region.py").read_bytes()).hexdigest()
     elevation, metadata = generate_region(backend, latent, saved["seed"], bounds,
-                                          width, height, metadata, directory, progress)
+                                          width, height, metadata, directory, progress,
+                                          decoder_cache_bytes=(cache_budgets or {}).get('decoder_cache_bytes',64*1024**2))
     metadata["radius_metres"] = saved["radius_metres"]
     return elevation, metadata, climate

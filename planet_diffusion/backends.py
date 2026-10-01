@@ -2,6 +2,8 @@
 import json
 from pathlib import Path
 import sys
+from contextlib import contextmanager
+from functools import lru_cache
 import numpy as np
 
 UPSTREAM_COMMIT = "e8dcb4b1a834ab2f6b1a6f5256ed7c9f2f3e8230"
@@ -10,6 +12,67 @@ MEANS = np.array([-37.67916460232751, 2.22578822145657, 18.030293275011356,
                   333.8442390481231, 1350.1259248456176, 52.444339366764396], np.float32)
 STDS = np.array([39.68515115440358, 3.0981253981231522, 8.940333096712806,
                  322.25238547630295, 856.3430083394657, 30.982620765341043], np.float32)
+
+
+def resolve_device(device="auto"):
+    if device not in ("auto", "cpu", "cuda"):
+        raise ValueError("Device must be auto, cpu or cuda")
+    if device != "auto":
+        return device
+    import torch
+    return "cuda" if torch.cuda.is_available() else "cpu"
+
+
+def resolve_precision(precision, device, torch):
+    """Select a stable hardware policy; timing noise must not alter seeded runs.
+
+    Native bfloat16 improved decoder throughput in trained-model measurements.
+    TF32 did not improve throughput, so Auto uses float32 when native bfloat16
+    is unavailable. Explicit modes remain available for individual workloads.
+    """
+    if precision not in ('auto','float32','tf32','bfloat16'):
+        raise ValueError('Precision must be auto, float32, tf32 or bfloat16')
+    if precision == 'auto':
+        if (device == 'cuda' and torch.cuda.get_device_capability()[0] >= 8
+                and torch.cuda.is_bf16_supported()):
+            return 'bfloat16'
+        return 'float32'
+    if precision != 'float32' and device != 'cuda':
+        raise ValueError('Optional precision modes require CUDA')
+    if precision == 'bfloat16' and not torch.cuda.is_bf16_supported():
+        raise ValueError('This CUDA device does not support bfloat16')
+    return precision
+
+
+def model_files(directory):
+    return tuple((file.relative_to(directory).as_posix(), file.stat().st_size,
+                  file.stat().st_mtime_ns, file.stat().st_ctime_ns)
+                 for file in sorted(directory.rglob("*"))
+                 if file.is_file() and file.suffix in (".json", ".safetensors", ".bin"))
+
+
+@lru_cache(maxsize=8)
+def _model_revision(directory, files):
+    """Reuse weight hashes only while all file stat signatures remain unchanged."""
+    import hashlib
+    digest = hashlib.sha256()
+    for name, *_ in files:
+        digest.update(name.encode())
+        with (Path(directory)/name).open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024*1024), b""):
+                digest.update(chunk)
+    return "sha256:"+digest.hexdigest()
+
+
+class _LazyModels(dict):
+    def __init__(self, load):
+        super().__init__()
+        self.load = load
+
+    def __missing__(self, stage):
+        model = self.load(stage)
+        self[stage] = model
+        return model
 
 
 def _limit_windows_cuda_memory(torch, device):
@@ -54,6 +117,12 @@ class DiagnosticBackend:
     def coarse_finish(self, state):
         return state
 
+    def sample_coarse_tile(self, noise, cond, steps):
+        state = noise*self.start_coarse(steps)
+        for step in range(steps):
+            state = self.coarse_advance(self.coarse_predict(state,cond,step),state,step)
+        return self.coarse_finish(state)
+
     def predict(self, stage, a, cond, t):
         # Spatial context is intentionally used so broken halo reads affect tests.
         base = (a + np.roll(a, 1, -1) + np.roll(a, 1, -2))/3
@@ -71,10 +140,13 @@ class DiagnosticBackend:
 class TerrainBackend:
     name = "terrain-diffusion"
 
-    def __init__(self, upstream, model, revision, device="cpu"):
+    def __init__(self, upstream, model, revision, device="cpu", precision="auto"):
         import os
         os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
         import torch
+        device = resolve_device(device)
+        precision = resolve_precision(precision,device,torch)
+        self.precision = precision
         source = Path(upstream).resolve()
         if not (source / "terrain_diffusion/models/edm_unet.py").is_file():
             raise ValueError("--upstream must point to the pinned terrain-diffusion checkout")
@@ -93,15 +165,7 @@ class TerrainBackend:
         from huggingface_hub import snapshot_download
         if Path(model).is_dir():
             model_dir = Path(model).resolve()
-            import hashlib
-            digest = hashlib.sha256()
-            for file in sorted(model_dir.rglob("*")):
-                if file.is_file() and file.suffix in (".json", ".safetensors", ".bin"):
-                    digest.update(file.relative_to(model_dir).as_posix().encode())
-                    with file.open("rb") as f:
-                        for chunk in iter(lambda: f.read(1024*1024), b""):
-                            digest.update(chunk)
-            resolved_revision = "sha256:"+digest.hexdigest()
+            resolved_revision = _model_revision(str(model_dir), model_files(model_dir))
         else:
             model_dir = Path(snapshot_download(model, revision=revision,
                 allow_patterns=["config.json", "coarse_model/*", "base_model/*", "decoder_model/*"]))
@@ -121,13 +185,12 @@ class TerrainBackend:
         self.torch, self.device, self.mp_concat = torch, device, mp_concat
         torch.use_deterministic_algorithms(True)
         torch.backends.cudnn.benchmark = False
-        torch.backends.cuda.matmul.allow_tf32 = False
-        torch.backends.cudnn.allow_tf32 = False
+        torch.backends.cuda.matmul.allow_tf32 = precision == "tf32"
+        torch.backends.cudnn.allow_tf32 = precision == "tf32"
         cuda_memory_fraction = _limit_windows_cuda_memory(torch, device)
-        self.models = {}
-        for stage, folder in [("coarse", "coarse_model"), ("latent", "base_model"), ("decoder", "decoder_model")]:
-            self.models[stage] = EDMUnet2D.from_pretrained(
-                str(model_dir/folder), low_cpu_mem_usage=False).eval().to(device)
+        folders = {"coarse":"coarse_model", "latent":"base_model", "decoder":"decoder_model"}
+        self.models = _LazyModels(lambda stage: EDMUnet2D.from_pretrained(
+            str(model_dir/folders[stage]), low_cpu_mem_usage=False).eval().to(device))
         self.scheduler = EDMDPMSolverMultistepScheduler(sigma_min=.002, sigma_max=80, sigma_data=.5)
         import importlib.metadata
         self.metadata = {"backend": self.name, "model": model, "model_revision": resolved_revision,
@@ -137,6 +200,18 @@ class TerrainBackend:
                          "python": sys.version.split()[0],
                          "diffusers": importlib.metadata.version("diffusers"),
                          "training_metres_per_pixel": config.get("native_resolution", 90.)}
+        if precision != "float32":
+            self.metadata["precision"] = precision
+
+    @contextmanager
+    def inference(self):
+        torch = self.torch
+        precision = getattr(self,"precision","float32")
+        torch.backends.cuda.matmul.allow_tf32 = precision == "tf32"
+        torch.backends.cudnn.allow_tf32 = precision == "tf32"
+        with torch.inference_mode(), torch.autocast(device_type="cuda",
+                dtype=torch.bfloat16, enabled=precision == "bfloat16"):
+            yield
 
     def tensor(self, a):
         return self.torch.as_tensor(np.asarray(a).copy(), dtype=self.torch.float32, device=self.device)
@@ -152,20 +227,38 @@ class TerrainBackend:
         label = self.scheduler.trigflow_precondition_noise(sigma.reshape(1))
         snr = self.tensor(self.cond_snr)
         inputs = [v.reshape(1) for v in torch.log(snr/8)]
-        with torch.inference_mode():
+        with self.inference():
             result = self.models["coarse"](torch.cat([scaled, self.tensor(cond)[None]], 1),
                       noise_labels=label, conditional_inputs=inputs)
-        return result[0].cpu().numpy()
+        return result[0].float().cpu().numpy()
 
     def coarse_advance(self, prediction, state, step):
         # start_coarse resets history before each independent coarse tile.
         torch = self.torch
-        with torch.inference_mode():
+        with self.inference():
             return self.scheduler.step(torch.from_numpy(prediction.copy())[None],
                 self.scheduler.timesteps[step], torch.from_numpy(state.copy())[None]).prev_sample[0].numpy()
 
     def coarse_finish(self, state):
         return state/.5
+
+    def sample_coarse_tile(self, noise, cond, steps):
+        """Keep a complete independent denoising trajectory on the model device."""
+        torch = self.torch
+        sigma_initial = self.start_coarse(steps)
+        with self.inference():
+            state = self.tensor(noise)[None]*sigma_initial
+            conditioning = self.tensor(cond)[None]
+            inputs = [v.reshape(1) for v in torch.log(self.tensor(self.cond_snr)/8)]
+            sigmas = self.scheduler.sigmas.to(self.device)
+            for step in range(steps):
+                sigma = sigmas[step]
+                scaled = self.scheduler.precondition_inputs(state,sigma)
+                label = self.scheduler.trigflow_precondition_noise(sigma.reshape(1))
+                prediction = self.models['coarse'](torch.cat([scaled,conditioning],1),
+                    noise_labels=label,conditional_inputs=inputs)
+                state = self.scheduler.step(prediction,self.scheduler.timesteps[step],state).prev_sample
+            return (state[0]/.5).cpu().numpy()
 
     def predict(self, stage, a, cond, t):
         return self.predict_batch(stage, a[None], cond[None], t)[0]
@@ -187,6 +280,6 @@ class TerrainBackend:
         else:
             model_input = self.tensor(np.concatenate([a, cond], axis=1))
             inputs = []
-        with torch.inference_mode():
+        with self.inference():
             result = self.models[stage](model_input, noise_labels=self.tensor(np.full(batch,t)), conditional_inputs=inputs)
-        return result.cpu().numpy()
+        return result.float().cpu().numpy()

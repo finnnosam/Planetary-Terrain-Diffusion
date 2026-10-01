@@ -5,6 +5,14 @@ import sys
 from .storage import load_state, save_state, export_tiff, verify_state, load_climate
 
 
+def cache_budgets(args):
+    budgets = {name:getattr(args,name.replace('_bytes','_mib'))
+               for name in ('patch_cache_bytes','blend_cache_bytes','decoder_cache_bytes')}
+    if any(value < 0 for value in budgets.values()):
+        raise ValueError("Cache budgets must be nonnegative")
+    return {name:value*1024**2 for name,value in budgets.items()}
+
+
 def confirm_region(bounds, width, height, n, allowed=False):
     from .region import estimate_decoder_patches
     count = estimate_decoder_patches(bounds,width,height,n,stop_after=100000)
@@ -21,7 +29,7 @@ def confirm_region(bounds, width, height, n, allowed=False):
         raise ValueError("Regional generation cancelled")
 
 
-def main(argv=None):
+def main(argv=None, backend_factory=None):
     parser = argparse.ArgumentParser(description="Generate spherical elevation with Terrain Diffusion")
     sub = parser.add_subparsers(dest="command", required=True)
     gen = sub.add_parser("generate", help="Generate a globe or regional spherical GeoTIFF")
@@ -29,14 +37,17 @@ def main(argv=None):
     gen.add_argument("--output", required=True)
     gen.add_argument("--climate-output", help="Also export a five-band climate GeoTIFF (cube geometry)")
     gen.add_argument("--seed", default="random", help="Unsigned integer, or random (default); printed and saved")
-    gen.add_argument("--draft", help="2:1 global PNG: black ocean, lighter shades higher land")
+    gen.add_argument("--draft", help="2:1 global PNG: brightness maps linearly between black and white elevations")
     gen.add_argument("--conditioning-dir", help="Folder of global elevation/climate conditioning TIFFs; alternative to --draft")
     gen.add_argument("--snr", help="Five comma-separated TIFF refinement values: elevation, temperature, T std, precipitation, P CV (default .2,.2,1,.2,1)")
-    gen.add_argument("--draft-ocean-depth", type=float, default=0., help="Ocean depth prior in metres; 0 = automatic learned bathymetry (default)")
+    endpoints = gen.add_mutually_exclusive_group()
+    endpoints.add_argument("--draft-black-metres", type=float, help="Elevation assigned to black (default -2000 m); grayscale is interpolated linearly")
+    endpoints.add_argument("--draft-ocean-depth", type=float, default=0., help="Compatibility option: positive depth sets black to its negative; 0 uses -2000 m")
     gen.add_argument("--draft-white-metres", type=float, default=4000., help="Elevation assigned to white (default 4000 m)")
     gen.add_argument("--draft-refinement", type=float, default=.2, help="Upstream conditioning noise, 0.01..4; smaller follows guide more closely (default .2)")
     gen.add_argument("--coarse-height", type=int, help="Logical guide height, multiple of 4; regional default 1024 (90 m) or 2560 (30 m)")
     gen.add_argument("--regional-only", action="store_true", help="Use sparse fixed-grid guides; requires --bounds")
+    gen.add_argument('--preview',action='store_true',help='Choose a cheaper regional grid matching output pixel density')
     gen.add_argument("--allow-large-region", action="store_true", help="Allow a region estimated above 2,000 decoder patches")
     gen.add_argument("--coarse-steps", type=int, default=20)
     gen.add_argument("--latent-batch-size", type=int, default=1,
@@ -55,7 +66,12 @@ def main(argv=None):
     gen.add_argument("--model", default=MODEL_90M,
                      help="Upstream model ID or local folder; 30 m and 90 m checkpoints are supported")
     gen.add_argument("--revision", help="HF revision (default: pinned revision for 30 m or 90 m model)")
-    gen.add_argument("--device", choices=["cpu", "cuda"], default="cpu")
+    gen.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
+    gen.add_argument("--precision", choices=["auto", "float32", "tf32", "bfloat16"], default="auto",
+                     help="Auto uses native CUDA bfloat16 when supported, otherwise float32")
+    gen.add_argument("--patch-cache-mib", type=int, default=64)
+    gen.add_argument("--blend-cache-mib", type=int, default=8)
+    gen.add_argument("--decoder-cache-mib", type=int, default=64)
     gen.add_argument("--threads", type=int, default=4, help="CPU torch threads (default: 4)")
     tile = sub.add_parser("export", help="Export native-resolution tiles or another overview from saved state")
     tile.add_argument("--state", required=True)
@@ -73,11 +89,16 @@ def main(argv=None):
     query.add_argument("--output", required=True)
     query.add_argument("--climate-output", help="Also export five-band climate from the saved state")
     query.add_argument("--upstream", default="upstream")
+    query.add_argument("--patch-cache-mib", type=int, default=64)
+    query.add_argument("--blend-cache-mib", type=int, default=8)
+    query.add_argument("--decoder-cache-mib", type=int, default=64)
     check = sub.add_parser("verify", help="Check saved state's sphere topology and integrity")
     check.add_argument("--state", required=True)
     sub.add_parser("gui", help="Open the desktop launcher")
     args = parser.parse_args(argv)
     try:
+        if args.command in ('generate','query'):
+            budgets = cache_budgets(args)
         if args.command == "gui":
             from .gui import main as gui_main
             return gui_main()
@@ -91,26 +112,33 @@ def main(argv=None):
         if args.command == "query":
             from pathlib import Path
             from .backends import DiagnosticBackend, TerrainBackend
-            from .query import load_query, query_region
+            make_backend = backend_factory or TerrainBackend
+            from .query import load_query, query_loaded_region
             if Path(args.output).exists():
                 raise ValueError("Output path must not already exist")
             saved = json.loads((Path(args.state)/"planet.json").read_text(encoding="utf-8"))
             confirm_region(args.bounds,args.width,args.height,saved["face_native_intervals"],
                            args.allow_large_region)
-            directory, identity, _, _, _ = load_query(args.state,args.checkpoint_dir,
-                                                       with_climate=bool(args.climate_output))
+            loaded = load_query(args.state,args.checkpoint_dir,
+                                with_climate=bool(args.climate_output))
+            _, identity, _, _, _ = loaded
             if identity.get("backend") == DiagnosticBackend.name:
                 backend = DiagnosticBackend()
             elif identity.get("backend") == TerrainBackend.name:
                 import torch
                 torch.set_num_threads(int(identity["torch_threads"]))
-                backend = TerrainBackend(args.upstream,identity["model"],
-                                         identity["model_revision"],identity["device"])
+                backend = make_backend(args.upstream,identity["model"],
+                    identity["model_revision"],identity["device"],
+                    precision=identity.get("precision","float32"))
             else:
                 raise ValueError("Unsupported checkpoint backend")
-            elevation, metadata, climate = query_region(
-                backend,args.state,args.bounds,args.width,args.height,directory,
+            if identity.get('backend') == TerrainBackend.name:
+                print(f"Compute: {backend.metadata['device']}; precision: {backend.precision} (saved run)",
+                      file=sys.stderr,flush=True)
+            elevation, metadata, climate = query_loaded_region(
+                backend,loaded,args.bounds,args.width,args.height,
                 with_climate=bool(args.climate_output),
+                cache_budgets=cache_budgets(args),
                 progress=lambda s:print(s,file=sys.stderr,flush=True))
             export_tiff(args.output,elevation,metadata)
             if args.climate_output:
@@ -125,6 +153,11 @@ def main(argv=None):
             from .model_presets import default_revision, sparse_guide_height
             from .seeds import resolve_seed
             checkpoint_dir = args.checkpoint_dir or (args.state+".checkpoints" if args.geometry == "cube" else None)
+            if args.preview:
+                if not args.regional_only or args.bounds is None or args.coarse_height is not None:
+                    raise ValueError('--preview requires --regional-only and --bounds; omit --coarse-height')
+                from .region import preview_guide_height
+                args.coarse_height = preview_guide_height(args.bounds,args.width,args.height)
             if args.coarse_height is None:
                 args.coarse_height = sparse_guide_height(args.model) if args.regional_only else 8
             if args.regional_only and (args.geometry != "cube" or args.bounds is None):
@@ -175,7 +208,8 @@ def main(argv=None):
                 if args.geometry != "cube":
                     raise ValueError("PNG draft import requires cube geometry")
                 from .draft import Draft
-                draft = Draft(args.draft,args.draft_ocean_depth,args.draft_white_metres,args.draft_refinement)
+                draft = Draft(args.draft,args.draft_ocean_depth,args.draft_white_metres,args.draft_refinement,
+                              black_metres=args.draft_black_metres)
                 if args.coarse_height < 16:
                     print("Draft note: use coarse-height 16 or 32 for more recognizable global structure; each guide cell produces 256 output pixels.",file=sys.stderr)
             if region:
@@ -188,15 +222,18 @@ def main(argv=None):
             else:
                 import torch
                 torch.set_num_threads(args.threads)
-                backend = TerrainBackend(args.upstream, args.model,
-                                         args.revision or default_revision(args.model), args.device)
+                backend = (backend_factory or TerrainBackend)(args.upstream, args.model,
+                    args.revision or default_revision(args.model), args.device, precision=args.precision)
+                print(f"Compute: {backend.metadata['device']}; precision: {backend.precision}",
+                      file=sys.stderr,flush=True)
             progress = lambda s: print(s, file=sys.stderr, flush=True)
             climate = None
             if args.geometry == "cube":
                 if args.regional_only:
                     from .sparse import SparseWorld
                     world = SparseWorld(backend,args.seed,args.coarse_height,args.coarse_steps,
-                        args.radius_metres,checkpoint_dir,source=conditioning or draft)
+                        args.radius_metres,checkpoint_dir,source=conditioning or draft,
+                        latent_batch_size=args.latent_batch_size, **cache_budgets(args))
                     a,metadata,climate = world.region(bounds,args.width,height,
                         with_climate=bool(args.climate_output),progress=progress)
                 else:
@@ -204,6 +241,7 @@ def main(argv=None):
                     generated = generate_cube(backend,args.seed,args.coarse_height//2,args.coarse_steps,
                         progress=progress,checkpoint_dir=checkpoint_dir,draft=draft,region=region,
                         latent_batch_size=args.latent_batch_size,
+                        decoder_cache_bytes=budgets['decoder_cache_bytes'],
                         with_climate=bool(args.climate_output),conditioning=conditioning)
                     if args.climate_output:
                         a, metadata, climate = generated

@@ -9,8 +9,21 @@ import math
 import time
 import numpy as np
 from . import cube
-from .cache import PredictionCache
+from .cache import ArrayCache, PredictionCache
 from .detail import decoder_conditioning, DECODER_SIZE, DECODER_STRIDE
+
+
+def _coordinate_groups(keys):
+    """Yield each key and its flat indices without one full scan per key."""
+    keys = np.asarray(keys).ravel()
+    if not len(keys):
+        return
+    order = np.argsort(keys, kind="stable")
+    sorted_keys = keys[order]
+    starts = np.r_[0, np.flatnonzero(sorted_keys[1:] != sorted_keys[:-1])+1]
+    ends = np.r_[starts[1:], len(order)]
+    for start, end in zip(starts, ends):
+        yield int(sorted_keys[start]), order[start:end]
 
 
 def validate_region(bounds, width, height, native_height=None):
@@ -33,6 +46,13 @@ def validate_region(bounds, width, height, native_height=None):
             coarse = max(4, 4*math.ceil(needed/1024))
             raise ValueError(f"Regional output exceeds native detail; increase coarse height to at least {coarse}, or reduce output resolution")
     return [west, south, east, north]
+
+
+def preview_guide_height(bounds, width, height):
+    """Smallest legal detail grid matching the requested pixel density."""
+    west,south,east,north = validate_region(bounds,width,height)
+    needed = max(width*180/(east-west),height*180/(north-south))
+    return max(4,4*math.ceil(needed/1024))
 
 
 def estimate_decoder_patches(bounds, width, height, n, stop_after=None):
@@ -137,11 +157,9 @@ class Field:
         result = np.empty(len(y), np.float32)
         tiles = self.n//self.tile+1
         keys = (f*tiles+y//self.tile)*tiles+x//self.tile
-        unique, inverse = np.unique(keys, return_inverse=True)
-        for i, key in enumerate(unique):
+        for key, use in _coordinate_groups(keys):
             face, remainder = divmod(int(key),tiles*tiles)
             ty, tx = divmod(remainder,tiles)
-            use = inverse == i
             result[use] = self.block(int(face), int(ty), int(tx))[y[use]%self.tile, x[use]%self.tile]
         return result.reshape(shape)
 
@@ -175,14 +193,15 @@ def noise_field(seed, n):
 
     def raw(f, y, x):
         y, x = np.broadcast_arrays(y, x)
-        out = np.empty(y.shape, np.float32)
+        shape = y.shape
+        y, x = y.ravel(), x.ravel()
+        out = np.empty(len(y), np.float32)
         tiles = n//64+1
         keys = (y//64)*tiles+x//64
-        for key in np.unique(keys):
+        for key, use in _coordinate_groups(keys):
             ty, tx = divmod(int(key),tiles)
-            use = keys == key
             out[use] = tile(f, int(ty), int(tx))[y[use]%64, x[use]%64]
-        return out
+        return out.reshape(shape)
     return Field(n, raw, tile=64, noise=True)
 
 
@@ -199,14 +218,12 @@ def filtered(field, weights, axis, output_n=None):
             if axis == 0:
                 extended = np.arange(y[0,0]-radius,y[-1,0]+radius+1)[:,None]
                 halo = field.read(f,extended,x)
-                for i,w in enumerate(weights):
-                    out += w*halo[i:i+len(y)*scale:scale,:]
+                windows = np.lib.stride_tricks.sliding_window_view(halo,len(weights),axis=0)[::scale]
             else:
                 extended = np.arange(x[0,0]-radius,x[0,-1]+radius+1)[None,:]
                 halo = field.read(f,y,extended)
-                for i,w in enumerate(weights):
-                    out += w*halo[:,i:i+x.shape[1]*scale:scale]
-            return out.astype(np.float32)
+                windows = np.lib.stride_tricks.sliding_window_view(halo,len(weights),axis=1)[:,::scale]
+            return np.einsum('...k,k->...',windows,weights,dtype=np.float64).astype(np.float32)
         for i, w in enumerate(weights):
             offset = i-len(weights)//2
             out += w*field.read(f, y+offset if axis == 0 else y, x+offset if axis == 1 else x)
@@ -232,7 +249,8 @@ def reconstruct(residual, lowfreq):
     return Field(n, lambda f,y,x: residual.read(f,y,x)+low.read(f,y/scale,x/scale))
 
 
-def generate_region(backend, latent, seed, bounds, width, height, metadata, directory, progress):
+def generate_region(backend, latent, seed, bounds, width, height, metadata, directory, progress,
+                    decoder_cache_bytes=64*1024**2):
     started = time.perf_counter()
     n = metadata['face_native_intervals']
     noise = noise_field(seed, n)
@@ -255,8 +273,12 @@ def generate_region(backend, latent, seed, bounds, width, height, metadata, dire
         predict = PredictionCache(directory/'regional-decoder',
             {'generation':metadata, 'latent_sha256':latent_identity}, predict)
 
-    @lru_cache(maxsize=64)
+    patch_memory = ArrayCache(decoder_cache_bytes)
     def patch(f, y, x):
+        location = (f,y,x)
+        saved = patch_memory.get(location)
+        if saved is not None:
+            return saved
         def make_input():
             return noise.read(f, np.arange(y,y+512)[:,None], np.arange(x,x+512)[None,:], nearest=True)[None]*np.sin(t)
         if isinstance(predict, PredictionCache):
@@ -267,28 +289,34 @@ def generate_region(backend, latent, seed, bounds, width, height, metadata, dire
             seen.add((f,y,x))
             if len(seen) == 1 or len(seen)%16 == 0:
                 progress(f"regional decoder: {len(seen)} unique patches used (global would use {6*len(cube.tile_positions(n,DECODER_SIZE,DECODER_STRIDE,True))**2})")
+        patch_memory.put(location,prediction)
         return prediction
 
     weights = cube.linear_weight_window(DECODER_SIZE)
     def residual_raw(f, y, x):
         y, x = np.broadcast_arrays(y, x)
-        total, norm = np.zeros(y.shape, np.float64), np.zeros(y.shape, np.float64)
+        shape = y.shape
+        y, x = y.ravel(), x.ravel()
+        total, norm = np.zeros(len(y), np.float64), np.zeros(len(y), np.float64)
         stride = DECODER_STRIDE
-        for by, bx in np.unique(np.stack([y.ravel()//stride, x.ravel()//stride], axis=1), axis=0):
-            group = (y//stride == by) & (x//stride == bx)
+        tiles = n//stride+1
+        for key, group in _coordinate_groups((y//stride)*tiles+x//stride):
+            by, bx = divmod(key, tiles)
+            gy, gx = y[group], x[group]
             for py in (int(by-1)*stride, int(by)*stride):
                 for px in (int(bx-1)*stride, int(bx)*stride):
                     if py > n or px > n:
                         continue
-                    use = group & (y >= py) & (y < py+DECODER_SIZE) & (x >= px) & (x < px+DECODER_SIZE)
+                    use = (gy >= py) & (gy < py+DECODER_SIZE) & (gx >= px) & (gx < px+DECODER_SIZE)
                     if not use.any():
                         continue
-                    dy, dx = y[use]-py, x[use]-px
+                    indices = group[use]
+                    dy, dx = gy[use]-py, gx[use]-px
                     weight = weights[dy,dx]
-                    total[use] += patch(f,py,px)[dy,dx]*weight
-                    norm[use] += weight
+                    total[indices] += patch(f,py,px)[dy,dx]*weight
+                    norm[indices] += weight
         value = np.cos(t)*np.sin(t)*noise.read(f,y,x)*norm+np.sin(t)*total
-        return value*backend.residual_std+backend.residual_mean*norm, norm
+        return (value*backend.residual_std+backend.residual_mean*norm).reshape(shape), norm.reshape(shape)
 
     if hasattr(latent,"channel"):
         lowfreq = Field(latent.n,lambda f,y,x:latent.channel(4).read(f,y,x)*38.6-31.4)
@@ -310,6 +338,8 @@ def generate_region(backend, latent, seed, bounds, width, height, metadata, dire
     timing = {'seconds':time.perf_counter()-started, 'decoder_model_seconds':model_seconds,
               'decoder_model_calls':model_calls,
               'prediction_disk_reads':predict.hits if isinstance(predict,PredictionCache) else 0}
+    timing['decoder_cache_hits'] = patch_memory.hits
+    timing['decoder_cache_bytes'] = patch_memory.bytes
     progress(f"Regional detail finished in {timing['seconds']:.1f}s: {len(seen)} unique patches, "
              f"{model_calls} decoder evaluations, {timing['prediction_disk_reads']} saved predictions loaded")
     metadata = {**metadata, 'coverage':'region', 'bounds':bounds, 'output_width':width,

@@ -9,9 +9,12 @@ from .spherical_raster import GlobalRaster
 
 
 class Draft(GlobalRaster):
-    def __init__(self, path, ocean_depth=0., maximum=4000., refinement=.2):
-        if not np.isfinite([ocean_depth, maximum]).all() or ocean_depth < 0 or maximum <= 0:
-            raise ValueError("Draft ocean depth must be finite and >=0; white elevation must be finite and >0")
+    def __init__(self, path, ocean_depth=0., maximum=4000., refinement=.2, *, black_metres=None, _legacy_mapping=False):
+        if not np.isfinite(ocean_depth) or ocean_depth < 0:
+            raise ValueError("Draft ocean depth must be finite and >=0")
+        black = -(ocean_depth if ocean_depth > 0 else 2000.) if black_metres is None else float(black_metres)
+        if not np.isfinite([black, maximum]).all() or maximum <= black:
+            raise ValueError("Black and white elevations must be finite; white must be greater than black")
         if not np.isfinite(refinement) or not .01 <= refinement <= 4:
             raise ValueError("Draft refinement must be between 0.01 and 4")
         self.refinement = float(refinement)
@@ -36,10 +39,10 @@ class Draft(GlobalRaster):
                     bits = 8
         except (UnidentifiedImageError, Image.DecompressionBombError) as exc:
             raise ValueError(f"Cannot read draft PNG: {exc}") from exc
-        # Black specifies water coverage, not a measured, flat seafloor at zero.
-        # Automatic mode supplies a negative prior; learned bathymetry refines it.
+        # Legacy depth arguments still select the black endpoint for new runs.
         prior_depth = ocean_depth if ocean_depth > 0 else 2000.
-        metres = np.where(gray == 0,-prior_depth,maximum*gray)
+        metres = (np.where(gray == 0,-prior_depth,maximum*gray) if _legacy_mapping
+                  else black+(maximum-black)*gray)
         # Premultiplied elevation prevents transparent RGB from affecting heights.
         nodes = np.empty((3,h+1,w),np.float32)
         for channel,pixels in enumerate((metres*alpha,alpha,(gray>0)*alpha)):
@@ -59,6 +62,21 @@ class Draft(GlobalRaster):
                          "refinement":self.refinement,
                          "alpha":"transparent uses seeded procedural guide",
                          "sampling":"8x8 area-weighted cube-node footprint; periodic longitude; shared poles"}
+        if not _legacy_mapping:
+            self.metadata.update(mapping="linear elevation between black and white",
+                                 mapping_version="linear-v1", black_metres=black)
+            self.metadata.pop("black")
+            self.metadata.pop("ocean_depth_hint_metres")
+            self.metadata.pop("ocean_prior_metres")
+
+    @classmethod
+    def from_metadata(cls, path, info):
+        """Retain the original mapping when querying older saved PNG runs."""
+        if info.get("mapping_version") == "linear-v1":
+            return cls(path,maximum=info["white_metres"],refinement=info["refinement"],
+                       black_metres=info["black_metres"])
+        return cls(path,info["ocean_depth_hint_metres"],info["white_metres"],
+                   info["refinement"],_legacy_mapping=True)
 
     def conditioning(self, seed, n, **options):
         guide = cube.conditioning(seed,n,**options)
