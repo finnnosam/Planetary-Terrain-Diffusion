@@ -70,15 +70,11 @@ Use `.venv\Scripts\python.exe -m planet_diffusion COMMAND`. Paths below are rela
 | `--geometry cube\|equirectangular` | Geometry (default `cube`); `equirectangular` is legacy and does not support PNG/TIFF conditioning or climate export. |
 
 `--regional-only` is the practical choice when only a small area is needed. The 30 m and 90 m models need separate run folders. A requested regional pixel density cannot exceed the native density set by `--coarse-height`.
-Regional generation and `query` estimate unique decoder patches before starting the model. Above 2,000, the desktop launcher asks for confirmation; the CLI prompts in a terminal or requires `--allow-large-region` when unattended. The estimate includes reconstruction halos; the final logged patch count may differ.
+Regional generation and `query` ask for confirmation when the estimated region size exceeds 2,000 patches. The desktop launcher shows a confirmation dialog; the CLI prompts in a terminal. For unattended CLI runs, use `--allow-large-region`.
 
-Reducing export dimensions alone keeps the native generation grid. Use `--preview` or the desktop **Preview** level to lower that grid as well. A 4° × 4° region at 512 × 512 pixels uses guide height 92 in Preview, rather than 1024 for full 90 m detail. Preview changes the terrain realization; use separate run folders for Preview, Full detail, and different precision modes. Saved queries always retain their run's grid and precision.
+Reducing output dimensions alone does not lower generation detail. Use `--preview` or the desktop **Preview** level for lower-detail regional generation matched to your output dimensions in pixels. Preview can produce different terrain from Full detail; use separate run folders for Preview, Full detail, and different precision modes. Saved queries retain their run's detail level and precision.
 
-Models load only when an uncached dependency needs inference. Fully cached queries validate the saved identities and export without loading weights. The desktop worker retains loaded model stages between compatible jobs, reuses unchanged local weight hashes, and restarts when source code changes. Stop terminates the worker and preserves completed predictions; the next job starts a new worker.
-
-Precision Auto uses a fixed hardware rule: native bfloat16 on compatible CUDA GPUs, float32 on CPU and other GPUs. It does not retune from fluctuating timings, so repeated Auto generations on the same hardware use the same mode. Saved queries explicitly reuse their recorded mode. Numerical differences from earlier versions or other precision modes are allowed; independent current-code generations with identical seed/settings must match.
-
-On an RTX 3070, a measured 90 m crop (seed 42, 20 coarse steps, 8 × 8 output) was bitwise repeatable across two independent generations in all modes. TF32 had no measured speed gain; bfloat16 improved decoder time by about 20%. Differences from float32 do not establish quality degradation and are not a reason to exclude a repeatable faster mode. The policy reflects these measurements and native hardware support, rather than a guarantee of the fastest mode for every workload/GPU. Run `python tools/profile_performance.py --mode all` to reproduce cache/filtering/precision comparisons, or `--mode auto` to check fresh Auto generations and lazy cached replay; `--model models/terrain-diffusion-30m` selects the 30 m checkpoint.
+In the desktop UI, **Stop** preserves completed progress. Resume with the same settings and checkpoint folder.
 
 ### `export` and `query` options
 
