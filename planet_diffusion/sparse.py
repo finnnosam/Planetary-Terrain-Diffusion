@@ -225,8 +225,7 @@ class Stage(Channels):
                         for other in range(6):
                             use = np.isclose(p@cube.NORMAL[other],1,atol=1e-12,rtol=0)
                             if use.any():
-                                oy = np.rint(n*(1+p[use]@cube.DOWN[other])/2).astype(int)
-                                ox = np.rint(n*(1+p[use]@cube.RIGHT[other])/2).astype(int)
+                                oy,ox = (np.rint(v).astype(int) for v in cube.chart_indices(p[use],other,n))
                                 needed.update(dict.fromkeys(dependencies(other,oy,ox)))
             patches(list(needed))
 
@@ -301,6 +300,7 @@ class SparseWorld:
                     "face_coarse_intervals":self.n,"face_native_intervals":self.n*256,
                     "native_height":guide_height*256,"radius_metres":radius_metres,
                     "units":"m","source_sha256":digest.hexdigest(),
+                    "geometry":"six equi-angular charts; poles are regular face interiors",
                     "noise":"tile-seeded per-channel Gaussian, shared cube nodes",
                     "procedural_conditioning":{"frequency_mult":list(frequency),
                                                "drop_water_pct":drop_water,

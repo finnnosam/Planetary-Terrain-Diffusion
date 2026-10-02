@@ -56,7 +56,7 @@ def generate_cube(backend, seed, face_coarse=4, coarse_steps=20, progress=print,
                 "native_height":face_coarse*512, "numpy":np.__version__, "units":"m",
                 "vertical_datum":"model-defined zero sea level",
                 "grid":"generation: shared-node cubed sphere; export: equirectangular pixel centres",
-                "geometry":"six gnomonic charts; poles are regular face interiors",
+                "geometry":"six equi-angular charts; poles are regular face interiors",
                 "noise":"unit Gaussian per unique cube node; nearest-node model halos",
                 "source_sha256":digest.hexdigest(), "latent_batch_size":int(latent_batch_size)}
     import importlib.metadata

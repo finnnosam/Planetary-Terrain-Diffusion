@@ -1,7 +1,12 @@
-"""Shared-node cubed sphere; poles are ordinary face-interior points.
+"""Shared-node equi-angular cubed sphere; poles are ordinary face-interior points.
 
 Fields have shape (channels, 6, N+1, N+1). Model halos cross faces through
 3-D directions. Duplicate edge/corner entries identify one physical node.
+
+Node indices are equally spaced in angle along each chart axis, so neighbour
+spacing varies by at most sqrt(2) over a face (gnomonic charts vary by about
+2.1x, and 4.5x in cell area). The average spacing is unchanged: n intervals
+per quarter great circle.
 """
 from functools import lru_cache
 import numpy as np
@@ -11,22 +16,59 @@ RIGHT = np.array([[0,1,0],[-1,0,0],[0,-1,0],[1,0,0],[0,1,0],[0,1,0]], float)
 DOWN = np.array([[0,0,-1],[0,0,-1],[0,0,-1],[0,0,-1],[1,0,0],[-1,0,0]], float)
 
 
+QUARTER = np.pi/4
+
+
+def _angles(index, n):
+    """Chart angle of a (possibly fractional or out-of-face) node index."""
+    return QUARTER*(2*np.asarray(index, dtype=np.float64)/n-1)
+
+
 def directions(face, y, x, n, normalize=True):
+    """Directions of chart nodes; normalize=False returns unit-cube surface points.
+
+    Inside a face this is normalize(N + tan(a)R + tan(b)D). The equivalent
+    cos(a)cos(b)N + sin(a)cos(b)R + cos(a)sin(b)D form also extends halo
+    indices beyond an edge: along a chart axis they continue the same great
+    circle at the same angular step instead of compressing toward a horizon.
+    """
     y, x = np.broadcast_arrays(y, x)
-    p = NORMAL[face] + (2*x[..., None]/n-1)*RIGHT[face] + (2*y[..., None]/n-1)*DOWN[face]
+    a, b = _angles(x, n)[..., None], _angles(y, n)[..., None]
+    ca, sa, cb, sb = np.cos(a), np.sin(a), np.cos(b), np.sin(b)
+    p = ca*cb*NORMAL[face] + sa*cb*RIGHT[face] + ca*sb*DOWN[face]
+    norm = np.linalg.norm(p, axis=-1, keepdims=True)
+    degenerate = norm < 1e-12
+    if degenerate.any():
+        # Only reachable when both extended angles are exactly 90 degrees.
+        p = np.where(degenerate, sa*RIGHT[face] + sb*DOWN[face], p)
+        norm = np.linalg.norm(p, axis=-1, keepdims=True)
     if normalize:
-        p = p/np.linalg.norm(p, axis=-1, keepdims=True)
-    return p
+        return p/norm
+    return p/np.max(np.abs(p), axis=-1, keepdims=True)
+
+
+def chart_indices(p, face, n):
+    """Fractional (y, x) of directions p on one face chart; p must face it."""
+    den = np.sum(p*NORMAL[face], axis=-1)
+    x = n*(1+np.arctan2(np.sum(p*RIGHT[face], axis=-1), den)/QUARTER)/2
+    y = n*(1+np.arctan2(np.sum(p*DOWN[face], axis=-1), den)/QUARTER)/2
+    return y, x
 
 
 def coordinates(p, n):
     axis = np.argmax(np.abs(p), axis=-1)
     positive = np.take_along_axis(p, axis[..., None], -1)[..., 0] >= 0
     face = np.where(positive, np.array([0,1,4])[axis], np.array([2,3,5])[axis])
-    denominator = np.sum(p*NORMAL[face], axis=-1)
-    x = n*(1+np.sum(p*RIGHT[face], axis=-1)/denominator)/2
-    y = n*(1+np.sum(p*DOWN[face], axis=-1)/denominator)/2
+    y, x = chart_indices(p, face, n)
     return face, np.clip(y, 0, n), np.clip(x, 0, n)
+
+
+def area_weight(y, x, n):
+    """Relative solid angle per unit chart-index area (equi-angular Jacobian)."""
+    y, x = np.broadcast_arrays(y, x)
+    a, b = _angles(x, n), _angles(y, n)
+    ca, cb, sb = np.cos(a), np.cos(b), np.sin(b)
+    return ca*cb/(cb*cb+ca*ca*sb*sb)**1.5
 
 
 def _sample_indices(a, face, y, x, nearest=False):
@@ -59,6 +101,8 @@ def edge_groups(n):
         boundary = {(y,x) for y in (0,n) for x in range(n+1)}
         boundary |= {(y,x) for x in (0,n) for y in range(n+1)}
         for y,x in sorted(boundary):
+            # Topological key: the chart warp is odd and shared by all faces,
+            # so a physical edge node has the same index lattice as before.
             key = tuple((n*NORMAL[f]+(2*x-n)*RIGHT[f]+(2*y-n)*DOWN[f]).astype(int))
             groups.setdefault(key, []).append(f*(n+1)**2+y*(n+1)+x)
     members, ids, owners, counts = [], [], [], []
@@ -95,8 +139,9 @@ def noise(seed, stream, channels, n):
 def conditioning(seed, n, frequency_mult=None, drop_water_pct=.5, raw=False):
     """Source procedural channels sampled on one continuous 3-D sphere.
 
-    Radius gives n coarse cells per quarter great circle. Gnomonic chart
-    distortion remains, but neither face edges nor poles split the noise field.
+    Radius gives n coarse cells per quarter great circle, the exact spacing
+    along every equi-angular chart axis. Neither face edges nor poles split the
+    noise field.
     Raw mode is for source-compatible imported conditioning before encoding.
     """
     from . import procedural

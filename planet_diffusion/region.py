@@ -125,8 +125,7 @@ class Field:
                 if self.noise:
                     use &= counts == 0  # One Gaussian draw, never averaged.
                 if use.any():
-                    oy = np.rint(self.n*(1+p[use] @ cube.DOWN[other])/2).astype(int)
-                    ox = np.rint(self.n*(1+p[use] @ cube.RIGHT[other])/2).astype(int)
+                    oy, ox = (np.rint(v).astype(int) for v in cube.chart_indices(p[use], other, self.n))
                     raw = self.raw(other,oy,ox)
                     sums[use] += raw[0] if self.weighted else raw
                     counts[use] += raw[1] if self.weighted else 1

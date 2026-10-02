@@ -25,7 +25,7 @@ class GlobalRaster:
                     y = np.arange(n+1)[:,None]+dy
                     x = np.arange(n+1)[None,:]+dx
                     p = cube.directions(f,y,x,n,normalize=False)
-                    weight = np.linalg.norm(p,axis=-1)**-3
+                    weight = cube.area_weight(y,x,n)
                     accum[:,f] += self.evaluate(p)*weight
                     norm[f] += weight
         imported = cube.identify(accum/norm)
@@ -41,7 +41,7 @@ class GlobalRaster:
         for dy in offsets:
             for dx in offsets:
                 p = cube.directions(face,y+dy,x+dx,n,normalize=False)
-                weight = np.linalg.norm(p,axis=-1)**-3
+                weight = cube.area_weight(y+dy,x+dx,n)
                 total += self.evaluate(p)*weight
                 weight_sum += weight
         return (total/weight_sum).astype(np.float32)
