@@ -36,6 +36,8 @@ def _current_source_hash(identity, with_climate):
         digest.update((root / "spherical_raster.py").read_bytes())
     if "conditioning_tiffs" in identity:
         digest.update((root / "conditioning.py").read_bytes())
+    if "continent_guide" in identity:
+        digest.update((root / "continents.py").read_bytes())
     if identity["algorithm"] == "cubed-sphere-regional-v1":
         digest.update((root / "region.py").read_bytes())
     if with_climate:

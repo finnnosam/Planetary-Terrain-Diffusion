@@ -55,6 +55,16 @@ def load_launch_settings(path):
         parser.add_argument('--'+option,type=float,default=default)
     parser.add_argument('--bounds',type=float,nargs=4)
     parser.add_argument('--snr',default='.2,.2,1,.2,1')
+    parser.add_argument('--coarse-pooling',default='1')
+    parser.add_argument('--coarse-pool-mode',choices=('avg','max'),default='avg')
+    for option in ('continents','coarse-only'):
+        parser.add_argument('--'+option,action='store_true')
+    parser.add_argument('--continent-guide-height',type=int,default=48)
+    parser.add_argument('--continent-relief',type=float,default=1.)
+    parser.add_argument('--continent-step',type=float,default=3.)
+    parser.add_argument('--continent-detail')
+    parser.add_argument('--keep-checkpoints',action='store_true')
+    parser.add_argument('--continent-refinement')
     for option in ('regional-only','preview','allow-large-region'):
         parser.add_argument('--'+option,action='store_true')
     # Older or CLI-written launch files may also contain settings without UI controls.
@@ -88,10 +98,16 @@ def load_launch_settings(path):
                     model='30 m' if Path(args.model).name == 'terrain-diffusion-30m' else '90 m',
                     latent_batch_size=str(args.latent_batch_size),export_climate=bool(args.climate_output),
                     regional_only=args.regional_only,scope='Region' if args.bounds is not None else 'Whole globe',
-                    detail_level='Custom',bounds=[str(v) for v in (args.bounds or (-30,-30,30,30))])
+                    detail_level='Custom',bounds=[str(v) for v in (args.bounds or (-30,-30,30,30))],
+                    coarse_pooling=str(args.coarse_pooling),coarse_pool_mode=args.coarse_pool_mode,
+                    continents=args.continents,continent_guide=str(args.continent_guide_height),
+                    continent_relief=str(args.continent_relief),continent_step=str(args.continent_step),
+                    continent_refinement=args.continent_refinement or '',
+                    keep_checkpoints=args.keep_checkpoints,
+                    coarse_only=args.coarse_only)
     settings['warnings'] = [f"--{option.replace('_','-')} {getattr(args,option)}"
                             for option in ('backend','geometry','coarse_steps','patch_cache_mib',
-                                           'blend_cache_mib','decoder_cache_mib')
+                                           'blend_cache_mib','decoder_cache_mib','continent_detail')
                             if getattr(args,option) is not None]
     return settings
 
@@ -119,10 +135,12 @@ def python_executable():
     return str(console if path.name.lower() == "pythonw.exe" and console.exists() else path)
 
 
-def build_command(folder, seed, draft="", coarse_height=8, ocean_depth=0., white_metres=6250., device="cpu", refinement=.2, radius_metres=6371000., export_height=None, bounds=None, export_width=None, latent_batch_size=1, export_climate=False, conditioning_dir="", conditioning_snr=".2,.2,1,.2,1", regional_only=False, model_choice="90 m", precision="auto", black_metres=None):
+def build_command(folder, seed, draft="", coarse_height=8, ocean_depth=0., white_metres=6250., device="cpu", refinement=.2, radius_metres=6371000., export_height=None, bounds=None, export_width=None, latent_batch_size=1, export_climate=False, conditioning_dir="", conditioning_snr=".2,.2,1,.2,1", regional_only=False, model_choice="90 m", precision="auto", black_metres=None, coarse_pooling="1", coarse_pool_mode="avg", continents=False, continent_guide_height=48, continent_relief=1., continent_step=3., coarse_only=False, keep_checkpoints=False, continent_refinement=""):
     folder = Path(folder).expanduser().resolve()
-    if (folder/"state").exists() or (folder/"planet-native.tif").exists():
-        raise ValueError("This run already has output. Choose New run to preserve it.")
+    state_name, output_name = ("coarse-state","planet-coarse.tif") if coarse_only else ("state","planet-native.tif")
+    if (folder/state_name).exists() or (folder/output_name).exists():
+        raise ValueError("This run already has "+("a coarse preview" if coarse_only else "output")
+                         +". Choose New run to preserve it.")
     if export_climate and (folder/"planet-climate.tif").exists():
         raise ValueError("This run already has climate output. Choose New run to preserve it.")
     if coarse_height < 4 or coarse_height % 4:
@@ -144,17 +162,55 @@ def build_command(folder, seed, draft="", coarse_height=8, ocean_depth=0., white
         raise ValueError('Choose auto, float32, or an optional CUDA precision mode')
     if isinstance(latent_batch_size,bool) or not isinstance(latent_batch_size,int) or latent_batch_size < 1:
         raise ValueError("Latent batch size must be a positive integer")
+    from .model_presets import parse_coarse_pooling
+    pooling = parse_coarse_pooling(coarse_pooling)
+    if coarse_pool_mode not in ("avg","max"):
+        raise ValueError("Coarse pool mode must be avg or max")
+    if pooling != 1 and regional_only:
+        raise ValueError("Coarse pooling applies to whole-globe or dense regional runs; uncheck "
+                         "'Only generate requested region' or set pooling to 1")
+    if coarse_pool_mode == "max" and pooling != "auto" and pooling > 3:
+        raise ValueError("Max pooling above 3 turns most ocean into land; use avg")
+    if (continents or coarse_only) and regional_only:
+        raise ValueError("The continent pass and coarse preview need whole-globe generation; uncheck "
+                         "'Only generate requested region'")
+    if coarse_only and (bounds is not None or export_climate):
+        raise ValueError("Coarse layout preview is whole-globe elevation only; choose Whole globe without climate")
+    if continents and (draft.strip() or conditioning_dir.strip()):
+        raise ValueError("The continent pass replaces the draft PNG and TIFF folder; clear them or uncheck it")
+    if continents:
+        from .continents import ContinentGuide
+        class _Probe: cond_snr = (0.,)*5
+        refinement = str(continent_refinement).strip()
+        if refinement:
+            try:
+                refinement = float(refinement)
+            except ValueError:
+                raise ValueError("Continent refinement must be a number or blank") from None
+        ContinentGuide(_Probe(),continent_guide_height,continent_relief,continent_step,
+                       refinement=refinement or None)  # validate values
     resolved = resolve_seed(seed,folder/"checkpoints")
     cmd = [python_executable(),"-u","-m","planet_diffusion","generate",
-           "--seed",str(resolved),"--state",str(folder/"state"),
-           "--output",str(folder/"planet-native.tif"),"--checkpoint-dir",str(folder/"checkpoints"),
+           "--seed",str(resolved),"--state",str(folder/state_name),
+           "--output",str(folder/output_name),"--checkpoint-dir",str(folder/"checkpoints"),
            "--coarse-height",str(coarse_height),"--radius-metres",str(radius_metres),
            "--device",device,"--upstream",str(ROOT/"upstream"),
            "--latent-batch-size",str(latent_batch_size)]
     cmd += ['--precision',precision]
+    if pooling != 1 or coarse_pool_mode != "avg":
+        cmd += ["--coarse-pooling",str(pooling),"--coarse-pool-mode",coarse_pool_mode]
+    if continents:
+        cmd += ["--continents","--continent-guide-height",str(continent_guide_height),
+                "--continent-relief",str(continent_relief),"--continent-step",str(continent_step)]
+        if refinement:
+            cmd += ["--continent-refinement",str(refinement)]
+    if coarse_only:
+        cmd += ["--coarse-only"]
+    if keep_checkpoints:
+        cmd += ["--keep-checkpoints"]
     if export_climate:
         cmd += ["--climate-output",str(folder/"planet-climate.tif")]
-    if export_height is not None:
+    if export_height is not None and not coarse_only:
         cmd += ["--height",str(export_height)]
     if bounds is not None:
         cmd += ["--bounds",*[str(v) for v in bounds],"--width",str(export_width)]
@@ -225,7 +281,7 @@ class Launcher:
         self.stopping = False
         self.controls = []
         root.title("Planet Terrain Diffusion")
-        root.geometry("940x970")
+        root.geometry("1040x1000")
         root.minsize(850,800)
         root.protocol("WM_DELETE_WINDOW",self.close)
         main = ttk.Frame(root,padding=16)
@@ -250,6 +306,15 @@ class Launcher:
         self.precision = tk.StringVar(value='auto')
         self.model = tk.StringVar(value="90 m")
         self.latent_batch_size = tk.StringVar(value="1")
+        self.coarse_pooling = tk.StringVar(value="1")
+        self.coarse_pool_mode = tk.StringVar(value="avg")
+        self.continents = tk.BooleanVar(value=False)
+        self.continent_guide = tk.StringVar(value="48")
+        self.continent_relief = tk.StringVar(value="1.0")
+        self.continent_step = tk.StringVar(value="3")
+        self.continent_refinement = tk.StringVar(value="")
+        self.keep_checkpoints = tk.BooleanVar(value=False)
+        self.coarse_only = tk.BooleanVar(value=False)
         self.export_climate = tk.BooleanVar(value=False)
         self.regional_only = tk.BooleanVar(value=True)
         self.status = tk.StringVar(value="Choose a PNG draft or TIFF folder, or leave both blank for a procedural planet.")
@@ -269,6 +334,13 @@ class Launcher:
         detail.grid(row=6,column=2,sticky='e'); self.controls.append(detail)
         detail.bind('<<ComboboxSelected>>',self.change_regional_mode)
         self.entry(main,7,"Radius (metres)",self.radius_metres)
+        pooling = ttk.Frame(main)
+        pooling.grid(row=7,column=2,sticky="e")
+        ttk.Label(pooling,text="Layout pooling").pack(side="left",padx=(0,4))
+        for variable,values,width,state in ((self.coarse_pooling,["1","2","3","4","6","8","12","16","auto"],5,"normal"),
+                                            (self.coarse_pool_mode,["avg","max"],4,"readonly")):
+            widget = ttk.Combobox(pooling,textvariable=variable,values=values,width=width,state=state)
+            widget.pack(side="left",padx=(0,4)); self.controls.append(widget)
         ttk.Label(main,text="Output resolution (pixels)").grid(row=8,column=0,sticky="w")
         resolution = ttk.Frame(main)
         resolution.grid(row=8,column=1,sticky="ew",padx=8,pady=4)
@@ -306,8 +378,21 @@ class Launcher:
         ttk.Label(main,text="East < west crosses the date line. Latitude: −90 to 90. Drafts always cover the globe.").grid(row=18,column=0,columnspan=3,sticky="w",pady=(0,6))
         self.entry(main,19,"Conditioning TIFF folder (instead of PNG)",self.conditioning_dir,"Browse...",self.browse_conditioning)
         self.entry(main,20,"TIFF climate refinement: temp, T std, precip, P CV",self.climate_refinement)
+        layout = ttk.Frame(main)
+        layout.grid(row=21,column=0,columnspan=3,sticky="ew",pady=(4,0))
+        widget = ttk.Checkbutton(layout,text="Continent passes",variable=self.continents)
+        widget.pack(side="left"); self.controls.append(widget)
+        for label,variable in (("guide",self.continent_guide),("relief",self.continent_relief),
+                               ("step",self.continent_step),("refinement",self.continent_refinement)):
+            ttk.Label(layout,text=label).pack(side="left",padx=(10,4))
+            widget = ttk.Entry(layout,textvariable=variable,width=6)
+            widget.pack(side="left"); self.controls.append(widget)
+        widget = ttk.Checkbutton(layout,text="Keep checkpoints",variable=self.keep_checkpoints)
+        widget.pack(side="right"); self.controls.append(widget)
+        widget = ttk.Checkbutton(layout,text="Coarse layout only (fast preview)",variable=self.coarse_only)
+        widget.pack(side="right",padx=(0,10)); self.controls.append(widget)
         actions = ttk.Frame(main)
-        actions.grid(row=21,column=0,columnspan=3,sticky="ew",pady=8)
+        actions.grid(row=22,column=0,columnspan=3,sticky="ew",pady=8)
         self.generate = ttk.Button(actions,text="Generate / Resume",command=self.start)
         self.generate.pack(side="left"); self.controls.append(self.generate)
         load = ttk.Button(actions,text="Load settings…",command=self.load_settings)
@@ -318,10 +403,10 @@ class Launcher:
         self.stop = ttk.Button(actions,text="Stop",command=self.cancel,state="disabled")
         self.stop.pack(side="left",padx=8)
         ttk.Button(actions,text="Open run folder",command=self.open_folder).pack(side="right")
-        ttk.Label(main,textvariable=self.status,wraplength=850).grid(row=22,column=0,columnspan=3,sticky="w",pady=6)
+        ttk.Label(main,textvariable=self.status,wraplength=850).grid(row=23,column=0,columnspan=3,sticky="w",pady=6)
         logframe = ttk.Frame(main)
-        logframe.grid(row=23,column=0,columnspan=3,sticky="nsew")
-        main.rowconfigure(23,weight=1)
+        logframe.grid(row=24,column=0,columnspan=3,sticky="nsew")
+        main.rowconfigure(24,weight=1)
         self.log = tk.Text(logframe,height=12,wrap="word",state="disabled")
         scroll = ttk.Scrollbar(logframe,command=self.log.yview)
         self.log.configure(yscrollcommand=scroll.set)
@@ -476,7 +561,13 @@ class Launcher:
                 conditioning_snr=self.refinement.get()+","+self.climate_refinement.get(),
                 regional_only=self.regional_only.get() and self.scope.get() == "Region",
                 model_choice=self.model.get(),precision=self.precision.get(),
-                black_metres=float(self.black.get()))
+                black_metres=float(self.black.get()),
+                coarse_pooling=self.coarse_pooling.get(),coarse_pool_mode=self.coarse_pool_mode.get(),
+                continents=self.continents.get(),continent_guide_height=int(self.continent_guide.get()),
+                continent_relief=float(self.continent_relief.get()),
+                continent_step=float(self.continent_step.get()),coarse_only=self.coarse_only.get(),
+                continent_refinement=self.continent_refinement.get(),
+                keep_checkpoints=self.keep_checkpoints.get())
             if bounds is not None and not self.confirm_patch_count(
                     bounds,width,height,int(self.coarse_height.get())*128):
                 return

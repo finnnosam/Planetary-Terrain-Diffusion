@@ -8,29 +8,53 @@ import numpy as np
 from . import cube
 from .cache import PredictionCache
 from . import procedural
-from .coarse import sample_coarse, VERSION as COARSE_VERSION, TILE_SIZE, TILE_STRIDE
+from .coarse import (sample_coarse, pool_coarse, VERSION as COARSE_VERSION, TILE_SIZE, TILE_STRIDE,
+                     POOL_VERSION, POOL_MODES)
 from .detail import sample_latents, decoder_conditioning, DECODER_SIZE, DECODER_STRIDE, VERSION as DETAIL_VERSION
 
 
 def generate_cube(backend, seed, face_coarse=4, coarse_steps=20, progress=print,
                   audit=None, checkpoint_dir=None, draft=None, region=None, latent_batch_size=1,
-                  with_climate=False, conditioning=None, decoder_cache_bytes=64*1024**2):
-    """Return elevation/metadata; with_climate adds compact climate features as a third result."""
+                  with_climate=False, conditioning=None, decoder_cache_bytes=64*1024**2,
+                  coarse_pooling=1, coarse_pool_mode="avg", continents=None, coarse_only=False,
+                  keep_checkpoints=True):
+    """Return elevation/metadata; with_climate adds compact climate features as a third result.
+
+    coarse_pooling k > 1 runs the coarse model on a k-times finer guide grid
+    (face_coarse*k intervals), then pools each k x k block to face_coarse for
+    the latent and decoder stages, as upstream's coarse_pooling does.
+
+    continents is a ContinentGuide source (chained coarse-model passes). coarse_only
+    stops after the coarse stage and returns the unpooled coarse elevation in
+    metres on a 2*face_coarse*coarse_pooling equirectangular node grid.
+    keep_checkpoints=False skips saving the full-resolution residual and
+    elevation arrays; earlier stages are still checkpointed so a stopped run
+    can resume (see remove_checkpoints).
+    """
     if (isinstance(latent_batch_size, bool) or not isinstance(latent_batch_size, (int, np.integer))
             or latent_batch_size < 1):
         raise ValueError("latent_batch_size must be a positive integer")
     if not 0 <= seed < 2**64 or face_coarse < 2 or face_coarse % 2 or coarse_steps < 2:
         raise ValueError("Require unsigned 64-bit seed, even face_coarse >= 2, coarse_steps >= 2")
+    if (isinstance(coarse_pooling, bool) or not isinstance(coarse_pooling, (int, np.integer))
+            or coarse_pooling < 1):
+        raise ValueError("coarse_pooling must be a positive integer")
+    if coarse_pool_mode not in POOL_MODES:
+        raise ValueError(f"coarse_pool_mode must be one of {sorted(POOL_MODES)}")
+    coarse_pooling = int(coarse_pooling)
+    model_face_coarse = face_coarse*coarse_pooling
     if region is not None:
         from .region import validate_region
         bounds, width, height = region
         bounds = validate_region(bounds, width, height, face_coarse*512)
-    if draft is not None and conditioning is not None:
-        raise ValueError("Choose either a PNG draft or a conditioning TIFF folder")
-    source = conditioning if conditioning is not None else draft
+    if sum(value is not None for value in (draft, conditioning, continents)) > 1:
+        raise ValueError("Choose only one of a PNG draft, a conditioning TIFF folder or a continent pass")
+    if coarse_only and (region is not None or with_climate):
+        raise ValueError("Coarse-only output is whole-globe elevation without climate")
+    source = next((value for value in (conditioning, draft, continents) if value is not None), None)
     if source is not None:
         backend = copy.copy(backend)
-        backend.cond_snr = (conditioning.cond_snr.copy() if conditioning is not None
+        backend.cond_snr = (source.cond_snr.copy() if draft is None
                             else np.array([draft.refinement,.2,1.,.2,1.],np.float32))
     digest = hashlib.sha256()
     for name in ("cube.py","cube_generate.py","backends.py","procedural.py","coarse.py","detail.py"):
@@ -42,10 +66,12 @@ def generate_cube(backend, seed, face_coarse=4, coarse_steps=20, progress=print,
         getattr(backend, "drop_water_pct", procedural.DEFAULT_DROP_WATER))
     if draft is not None:
         digest.update(Path(__file__).with_name("draft.py").read_bytes())
-    if source is not None:
+    if draft is not None or conditioning is not None:
         digest.update(Path(__file__).with_name("spherical_raster.py").read_bytes())
     if conditioning is not None:
         digest.update(Path(__file__).with_name("conditioning.py").read_bytes())
+    if continents is not None:
+        digest.update(Path(__file__).with_name("continents.py").read_bytes())
     if region is not None:
         digest.update(Path(__file__).with_name("region.py").read_bytes())
     if with_climate:
@@ -62,10 +88,13 @@ def generate_cube(backend, seed, face_coarse=4, coarse_steps=20, progress=print,
     import importlib.metadata
     metadata["procedural_conditioning"] = {
         "version":"source-perlin-sphere-v1", "frequency_mult":list(frequency),
-        "drop_water_pct":drop_water, "radius_coarse_cells":2*face_coarse/np.pi,
+        "drop_water_pct":drop_water, "radius_coarse_cells":2*model_face_coarse/np.pi,
         "pyfastnoiselite":importlib.metadata.version("pyfastnoiselite")}
     metadata["coarse_sampling"] = {"version":COARSE_VERSION, "tile_size":TILE_SIZE,
                                    "tile_stride":TILE_STRIDE, "blend":"completed tiles; shared weighted sums"}
+    metadata["coarse_pooling"] = {"version":POOL_VERSION, "factor":coarse_pooling, "mode":coarse_pool_mode,
+                                  "model_coarse_height":2*model_face_coarse,
+                                  "model_face_coarse_intervals":model_face_coarse}
     metadata["detail_sampling"] = {"version":DETAIL_VERSION,"latent_size":64,"latent_stride":32,
                                    "decoder_size":DECODER_SIZE,"decoder_stride":DECODER_STRIDE,
                                    "halos":"nearest shared nodes; decoder repeats latent nodes 8x"}
@@ -76,6 +105,8 @@ def generate_cube(backend, seed, face_coarse=4, coarse_steps=20, progress=print,
         metadata["draft"] = draft.metadata
     if conditioning is not None:
         metadata["conditioning_tiffs"] = conditioning.metadata
+    if continents is not None:
+        metadata["continent_guide"] = continents.metadata
     if source is not None:
         metadata["conditioning_noise"] = backend.cond_snr.tolist()
     directory = Path(checkpoint_dir) if checkpoint_dir else None
@@ -124,16 +155,34 @@ def generate_cube(backend, seed, face_coarse=4, coarse_steps=20, progress=print,
 
     nc, nl, nd = face_coarse,face_coarse*32,face_coarse*256
     guides_started = time.perf_counter()
-    latent = restore("latent",5,nl)
+    latent = None if coarse_only else restore("latent",5,nl)
     coarse = None
+    if coarse_only:
+        model = restore("coarse-model",6,model_face_coarse) if coarse_pooling > 1 else restore("coarse",6,nc)
+        if model is not None:
+            return _coarse_only(model,metadata,model_face_coarse,progress)
     if latent is None:
         coarse = restore("coarse",6,nc)
         if coarse is None:
             options = dict(frequency_mult=frequency, drop_water_pct=drop_water)
-            raw_guide = (cube.conditioning(seed,nc,**options) if source is None
-                         else source.conditioning(seed,nc,**options))
-            coarse = sample_coarse(backend,seed,raw_guide,coarse_steps,progress,record)
-            coarse = record("coarse",cube.identify(coarse),save=True)
+            model = restore("coarse-model",6,model_face_coarse) if coarse_pooling > 1 else None
+            if model is None:
+                raw_guide = (cube.conditioning(seed,model_face_coarse,**options) if source is None
+                             else source.conditioning(seed,model_face_coarse,**options))
+                if continents is not None:
+                    for height,level in continents.levels:
+                        record(f"continent-pass-{height}",level,save=True)
+                    record("continent-guide",raw_guide,save=True)
+                model = sample_coarse(backend,seed,raw_guide,coarse_steps,progress,record)
+                model = cube.identify(model)
+                if coarse_pooling > 1:
+                    model = record("coarse-model",model,save=True)
+            if coarse_pooling > 1:
+                progress(f"coarse pooling: {coarse_pooling}x{coarse_pooling} {coarse_pool_mode} "
+                         f"(guide {2*model_face_coarse} -> {2*nc})")
+            coarse = record("coarse",pool_coarse(model,coarse_pooling,coarse_pool_mode),save=True)
+            if coarse_only:
+                return _coarse_only(model,metadata,model_face_coarse,progress)
         state = sample_latents(backend,coarse,seed,progress,record,latent_batch_size)
         latent = record("latent",state,save=True)
 
@@ -169,10 +218,48 @@ def generate_cube(backend, seed, face_coarse=4, coarse_steps=20, progress=print,
         pred = cube.consensus(xt,decode,size=DECODER_SIZE,stride=DECODER_STRIDE,
                               weight_window=cube.linear_weight_window(DECODER_SIZE),shared_weights=True,include_endpoint=True,
                               progress=lambda d,n:progress(f"cube decoder: {d}/{n} patches"))
-        residual = record("residual",cube.identify(np.cos(t)*xt+np.sin(t)*pred),save=True)
+        residual = record("residual",cube.identify(np.cos(t)*xt+np.sin(t)*pred),save=keep_checkpoints)
     progress("cube low-frequency reconstruction")
     z = cube.reconstruct(residual*backend.residual_std+backend.residual_mean,latent[4:5]*38.6-31.4)
-    elevation = record("cube-elevation",np.sign(z)*z*z,save=True)
+    elevation = record("cube-elevation",np.sign(z)*z*z,save=keep_checkpoints)
     progress("equirectangular export projection")
     projected = cube.to_equirectangular(elevation,nd*2)[0]
     return (projected, metadata, climate) if with_climate else (projected, metadata)
+
+
+def _coarse_only(model, metadata, n, progress):
+    """Unpooled coarse-model elevation (metres) as a whole-globe state."""
+    progress("coarse-only export projection")
+    elevation = np.sign(model[:1])*model[:1]**2
+    projected = cube.to_equirectangular(elevation,2*n)[0]
+    metadata = dict(metadata, output="coarse-only", native_height=2*n,
+                    face_native_intervals=n, pixel_scale="one coarse-model cell per pixel")
+    return projected, metadata
+
+
+def remove_checkpoints(directory):
+    """Delete only files this generator writes into a checkpoint directory.
+
+    Returns the number of bytes removed. Unrecognized files and folders are
+    left in place, and the directory itself is removed only when empty.
+    """
+    import shutil
+    directory = Path(directory)
+    if not (directory/"identity.json").is_file():
+        return 0
+    removed = 0
+    for path in list(directory.iterdir()):
+        name = path.name
+        if path.is_file() and (name.endswith((".npy", ".npy.tmp")) or name in (
+                "identity.json", "identity.json.tmp", "draft.png", "draft.png.tmp")):
+            removed += path.stat().st_size
+            path.unlink()
+        elif path.is_dir() and name in ("decoder", "regional-decoder", "conditioning"):
+            removed += sum(f.stat().st_size for f in path.rglob("*") if f.is_file())
+            shutil.rmtree(path)
+    try:
+        directory.rmdir()
+    except OSError:
+        pass
+    return removed
+

@@ -115,7 +115,8 @@ def edge_groups(n):
 
 
 def identify(a, noise=False):
-    a = np.array(a, dtype=np.float32, copy=True)
+    # C order: reshape below must be a view so shared-node writes land in a.
+    a = np.array(a, dtype=np.float32, copy=True, order="C")
     c, faces, h, w = a.shape
     if faces != 6 or h != w or h < 3:
         raise ValueError("Expected C x 6 x (N+1) x (N+1), N >= 2")
@@ -258,6 +259,53 @@ def reconstruct(residual, lowfreq):
     weights /= weights.sum()
     low = filter_axis(filter_axis(reduced,weights,1),weights,0)
     return identify(residual+resize(low,n))
+
+
+def _pool_weights(k):
+    """Box footprint of k fine intervals centred on a fine node."""
+    return np.ones(k)/k if k % 2 else np.r_[.5, np.ones(k-1), .5]/k
+
+
+def pool(a, k):
+    """Area-weighted mean of each k x k fine-cell footprint, read across faces.
+
+    A fine field with N = k*n intervals per face becomes n intervals; output
+    node i is centred on fine node k*i, as upstream avg_pool2d groups cells.
+    """
+    n = a.shape[-1]-1
+    if k == 1:
+        return identify(a)
+    if k < 1 or n % k:
+        raise ValueError("Pooling factor must divide the face intervals")
+    y, x = np.arange(n+1)[:, None], np.arange(n+1)[None, :]
+    area = np.ascontiguousarray(np.broadcast_to(area_weight(y, x, n), (1, 6, n+1, n+1)), dtype=np.float64)
+    w = _pool_weights(k)
+    def box(v):
+        return filter_axis(filter_axis(v, w, 1), w, 0)[:, :, ::k, ::k]
+    return identify(box(a*area)/box(area))
+
+
+def pool_extreme(a, k, reducer=np.max):
+    """Max or min over each pooled footprint, using nearest shared-node reads."""
+    n = a.shape[-1]-1
+    if k == 1:
+        return identify(a)
+    if k < 1 or n % k:
+        raise ValueError("Pooling factor must divide the face intervals")
+    radius = k//2
+    normal = np.arange(n+1)
+    extended = np.arange(-radius, n+radius+1)
+    out = np.array(a, dtype=np.float32, copy=True)
+    for axis in (1, 0):
+        source = out.copy()
+        for f in range(6):
+            ys, xs = (extended, normal) if axis == 0 else (normal, extended)
+            halo = read(source, f, ys[:, None], xs[None, :], nearest=True)
+            shifted = [halo[:, i:i+n+1, :] if axis == 0 else halo[:, :, i:i+n+1]
+                       for i in range(2*radius+1)]
+            out[:, f] = reducer(np.stack(shifted), axis=0)
+        out = identify(out)
+    return identify(out[:, :, ::k, ::k])
 
 
 def to_equirectangular(a, height):

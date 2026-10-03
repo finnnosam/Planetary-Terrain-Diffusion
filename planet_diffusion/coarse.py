@@ -5,10 +5,35 @@ from . import cube
 TILE_SIZE = 64
 TILE_STRIDE = 48
 VERSION = "completed-coarse-tiles-v1"
+POOL_VERSION = "cube-coarse-pooling-v1"
+# Elevation and p5 reducers. "max" is upstream's more extreme option: max
+# elevation and min p5. Climate channels are always averaged.
+POOL_MODES = {"avg": ("avg", "avg"), "max": ("max", "min")}
 
 
 def linear_weight_window(size=TILE_SIZE):
     return cube.linear_weight_window(size)
+
+
+def pool_coarse(coarse, k, mode="avg"):
+    """Compress a coarse field computed on a k-times finer grid (upstream coarse_pooling).
+
+    Channels are elevation, p5 elevation, then climate, in physical units as
+    returned by sample_coarse. Each output cell summarizes k x k model cells,
+    so the large-scale layout keeps model-scale distances while later stages
+    see one cell per k*k model cells.
+    """
+    if mode not in POOL_MODES:
+        raise ValueError(f"Coarse pool mode must be one of {sorted(POOL_MODES)}")
+    if k == 1:
+        return cube.identify(coarse)
+    elevation, p5 = POOL_MODES[mode]
+    pooled = cube.pool(coarse, k).astype(np.float32)
+    if elevation == "max":
+        pooled[0] = cube.pool_extreme(coarse[:1], k, np.max)[0]
+    if p5 == "min":
+        pooled[1] = cube.pool_extreme(coarse[1:2], k, np.min)[0]
+    return cube.identify(pooled)
 
 
 def sample_coarse(backend, seed, raw_guide, steps=20, progress=print, record=None):

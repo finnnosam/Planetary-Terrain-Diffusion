@@ -49,6 +49,15 @@ Use `.venv\Scripts\python.exe -m planet_diffusion COMMAND`. Paths below are rela
 | `--conditioning-dir DIR` | Folder of global conditioning GeoTIFFs described below; use instead of `--draft`. |
 | `--snr E,T,TS,P,PCV` | TIFF refinement for the five channels in the order below, each `0.01–4` (default `0.2,0.2,1,0.2,1`); smaller follows input more closely. Requires `--conditioning-dir`. |
 | `--coarse-height N` | Logical guide height in cells, multiple of 4; default `8`, or `1024` for regional-only 90 m / `2560` for regional-only 30 m. Native output height is `N × 256` pixels. |
+| `--coarse-pooling K\|auto` | Run the coarse model on a guide `K` times taller, then average each `K × K` block of cells down to `--coarse-height` (upstream `coarse_pooling`). Default `1`. `auto` picks `K` so coarse cells match the model's training size at `--radius-metres` (23 km for 90 m, 7.7 km for 30 m). Not available with `--regional-only`. |
+| `--coarse-pool-mode avg\|max` | `avg` (default) averages every channel; `max` keeps maximum elevation and minimum p5 per block. `max` is refused above `K = 3`, where it turns most ocean into land. |
+| `--continents` | Continent passes: run the coarse model on a small guide, then again on progressively finer guides, each guided by the previous pass, up to the coarse stage. Gives planet-scale layout with learned structure at every scale. Replaces `--draft`/`--conditioning-dir`; not available with `--regional-only`. |
+| `--continent-guide-height N` | Guide height of the first (rough) pass, multiple of 4 (default `48`). Smaller gives fewer, larger continents. Must not exceed the coarse model's guide height (`--coarse-height` × pooling). |
+| `--continent-step S` | Largest guide-height ratio between passes, `1.5–16` (default `3`; Earth at 90 m runs passes on guides 48, 124 and 328 before the 864 coarse stage). Smaller adds passes. |
+| `--continent-relief R` | Multiplies the final guide's land elevation, `0–4` (default `1`). |
+| `--continent-refinement S` | Elevation conditioning noise for the refining passes and the coarse stage, `0.01–4` (default: the model's setting). Higher lets each pass depart further from the previous one. |
+| `--keep-checkpoints` | Keep whole-globe checkpoints after a successful run. By default they are used only for resuming a stopped run, the full-resolution residual and elevation arrays (about 2 GB each at guide 72) are never written, and the checkpoint folder is removed when the run completes. Keep them for debugging, `tools\preview_layout.py` after a full run, or **Saved run query** on whole-globe runs. |
+| `--coarse-only` | Stop after the coarse stage and export its unpooled whole-globe elevation (one model coarse cell per pixel). Takes minutes. Rerun without it using the same `--checkpoint-dir` to continue to full detail. |
 | `--preview` | With `--regional-only`, choose the smallest guide grid matching regional output pixel density. Omit `--coarse-height`. |
 | `--regional-only` | Compute only the requested region; requires `--bounds`. |
 | `--allow-large-region` | Proceed when the regional decoder estimate exceeds 2,000 patches; useful for unattended runs. |
@@ -68,6 +77,10 @@ Use `.venv\Scripts\python.exe -m planet_diffusion COMMAND`. Paths below are rela
 | `--checkpoint-dir DIR` | Checkpoint directory (default `STATE.checkpoints` for cube runs). |
 | `--backend terrain\|diagnostic` | Backend (default `terrain`); `diagnostic` is for testing and does not generate learned terrain. |
 | `--geometry cube\|equirectangular` | Geometry (default `cube`); `equirectangular` is legacy and does not support PNG/TIFF conditioning or climate export. |
+
+**Horizontal scale.** The models have a fixed horizontal scale: a coarse cell is 256 native pixels (23 km for the 90 m model, 7.7 km for 30 m). Without pooling, an Earth-radius globe matches that only at guide height ≈868 (90 m) or ≈2606 (30 m); smaller guides enlarge every landform by the ratio, which `generate` prints. `--coarse-pooling auto` computes the coarse layout (continents, mountain-belt placement and width) at the model's scale, while finer detail stays `K` times enlarged. Large `K` smooths narrow ranges under `avg`; try `max`. Alternatively, keep `K = 1` and set the radius to about `guide height × 7,334 m` (90 m model).
+
+**Continents at real scale.** Upstream's procedural guide has no structure larger than about 1,400 km, so a correctly scaled Earth-sized globe without a draft looks like uniform noise. `--continents` builds planet-scale layout from chained coarse-model passes, from a small guide up to the real scale. A quick way to tune it is `--coarse-pooling auto --continents --coarse-only`, then render the saved stages with `.venv\Scripts\python.exe tools\preview_layout.py RUN_FOLDER`; it writes `checkpoints\layout-preview.png`.
 
 `--regional-only` is the practical choice when only a small area is needed. The 30 m and 90 m models need separate run folders. A requested regional pixel density cannot exceed the native density set by `--coarse-height`.
 Regional generation and `query` ask for confirmation when the estimated region size exceeds 2,000 patches. The desktop launcher shows a confirmation dialog; the CLI prompts in a terminal. For unattended CLI runs, use `--allow-large-region`.
@@ -120,6 +133,10 @@ Click **Load settings…** and choose an existing run's `launch.json` to restore
 | Export climate maps | Also save `planet-climate.tif` (off by default). |
 | Logical guide height / detail level | Cells, multiple of 4. Global default `16`; regional **Preview** chooses a grid matching output density. **Full detail** uses `1024` or `2560` for 90 m or 30 m. Editing the guide height selects **Custom**. |
 | Radius | Metres (default `6371000`). |
+| Layout pooling | Coarse pooling factor (`1`, a number, or `auto`) and mode (`avg` or `max`); see `--coarse-pooling`. |
+| Continent passes / guide / relief / step / refinement | See `--continents` and the `--continent-*` options (defaults `48`, `1.0`, `3`; blank refinement uses the model's setting). |
+| Keep checkpoints | See `--keep-checkpoints` (off by default). |
+| Coarse layout only (fast preview) | Writes `planet-coarse.tif` and `coarse-state` in the run folder. Uncheck it and click **Generate / Resume** in the same folder to continue to full detail from the saved coarse stage. |
 | Output resolution | Width and height in pixels (default `8192 × 4096` globally; `512 × 512` when switching to a region). Global width must be twice height. |
 | Black elevation | Signed elevation of black PNG pixels in metres (default `-2000`). |
 | White elevation | Elevation of white PNG pixels in metres (default `6250`). |
