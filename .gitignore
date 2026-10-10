@@ -43,6 +43,7 @@ tests/
 scripts/
 docs/
 requirements-tested.txt
+Commands.txt
 
 # Local AI and editor state
 .agents/
