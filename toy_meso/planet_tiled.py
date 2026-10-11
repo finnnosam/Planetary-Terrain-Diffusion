@@ -29,18 +29,30 @@ import torch
 from planet_diffusion import cube
 from .common import load_checkpoint, autocast, pick_device
 from .model import heun_sample
-from .sphere import GlobalRaster, encode, decode, EARTH_RADIUS_M
-from .planet import coarse_condition, write_tiff
+from .sphere import GlobalRaster, encode, decode, to_latlon, EARTH_RADIUS_M
 
-VERSION = "meso-tiled-v1"
+VERSION = "meso-tiled-v2-cell-centres"
 NOISE_BLOCK = 64
+
+
+def save_array(path, values):
+    """Only expose complete arrays, so terminating a run cannot poison its cache."""
+    path = Path(path)
+    temporary = path.with_suffix(".tmp.npy")
+    np.save(temporary, values)
+    temporary.replace(path)
 
 
 class Grid:
     """Fixed tile grid on a cube with N fine intervals per face."""
 
-    def __init__(self, N, size, stride):
-        self.N, self.size, self.stride = N, size, stride
+    def __init__(self, N, size, stride, factor=8):
+        if factor < 1 or N % factor or size % factor:
+            raise ValueError("fine intervals and tile size must be multiples of factor")
+        if not 0 < stride < size or stride % factor:
+            raise ValueError("stride must be a positive multiple of factor smaller than the tile")
+        self.N, self.size, self.stride, self.factor = N, size, stride, factor
+        self.coarse_halo = int(math.ceil(size / factor)) + 1
         self.starts = np.array(list(cube.tile_positions(N, size, stride)))
         members, ids, owners, _ = cube.edge_groups(N)
         order = np.argsort(members)
@@ -128,11 +140,46 @@ def tile_nodes(grid, f, ky, kx):
     return grid.flat(face, np.floor(fy + .5).astype(np.int64), np.floor(fx + .5).astype(np.int64))
 
 
+def coarse_condition_cells(raster, n, factor, halo, sub=8):
+    """Per-face cell averages at the training centres, including chart halos.
+
+    Fine nodes 0..factor-1 have their coarse average centred at (factor-1)/2.
+    Unlike a node field, these cell-centred charts have no shared edge entries:
+    halo cells are sampled on the sphere in their own face's extended chart.
+    """
+    centres = np.arange(-halo, n + halo + 1)
+    offset = (factor - 1) / (2 * factor)
+    offsets = (np.arange(sub) + .5) / sub - .5
+    out = np.empty((1, 6, len(centres), len(centres)), np.float32)
+    for face in range(6):
+        for start in range(0, len(centres), 16):
+            ys = centres[start:start + 16]
+            y = ys[:, None, None, None] + offset + offsets[None, None, :, None]
+            x = centres[None, :, None, None] + offset + offsets[None, None, None, :]
+            lat, lon = to_latlon(cube.directions(face, y, x, n))
+            out[0, face, start:start + len(ys)] = raster.sample(lat, lon).mean(axis=(-2, -1))
+    return out
+
+
+def condition_at(coarse_enc, factor, grid, face, y, x):
+    """Training's cell-centre interpolation at unshifted fine chart coordinates."""
+    offset = (factor - 1) / (2 * factor)
+    y, x = np.broadcast_arrays(np.asarray(y) / factor - offset + grid.coarse_halo,
+                               np.asarray(x) / factor - offset + grid.coarse_halo)
+    iy, ix = np.floor(y).astype(np.int64), np.floor(x).astype(np.int64)
+    a = coarse_enc[0, face]
+    if np.any(iy < 0) or np.any(ix < 0) or np.any(iy + 1 >= a.shape[0]) or np.any(ix + 1 >= a.shape[1]):
+        raise ValueError("condition lookup exceeds the saved chart halo")
+    fy, fx = y - iy, x - ix
+    return ((1 - fy) * ((1 - fx) * a[iy, ix] + fx * a[iy, ix + 1]) +
+            fy * ((1 - fx) * a[iy + 1, ix] + fx * a[iy + 1, ix + 1])).astype(np.float32)
+
+
 def tile_condition(coarse_enc, factor, grid, f, ky, kx):
-    """Bilinear coarse condition (encoded) at the tile's pixels; halos read across faces."""
-    ys = (grid.starts[ky] + np.arange(grid.size))[:, None] / factor
-    xs = (grid.starts[kx] + np.arange(grid.size))[None, :] / factor
-    return cube.read(coarse_enc, f, ys, xs)[0]
+    """Condition on the original fine nodes, aligned exactly as in training."""
+    ys = (grid.starts[ky] + np.arange(grid.size))[:, None]
+    xs = (grid.starts[kx] + np.arange(grid.size))[None, :]
+    return condition_at(coarse_enc, factor, grid, f, ys, xs)
 
 
 def up_at(coarse_enc, factor, grid, flat):
@@ -141,7 +188,7 @@ def up_at(coarse_enc, factor, grid, flat):
     out = np.empty(f.shape, np.float32)
     for face in np.unique(f):
         sel = f == face
-        out[sel] = cube.read(coarse_enc, int(face), y[sel] / factor, x[sel] / factor)[0]
+        out[sel] = condition_at(coarse_enc, factor, grid, int(face), y[sel], x[sel])
     return out
 
 
@@ -163,9 +210,7 @@ class TileCache:
     def save(self, key, arr):
         p = self.path(key)
         p.parent.mkdir(exist_ok=True)
-        tmp = p.with_suffix(".tmp.npy")
-        np.save(tmp, arr.astype(np.float32))
-        tmp.replace(p)
+        save_array(p, arr.astype(np.float32))
 
 
 def compute_tiles(keys, model, norm, coarse_enc, factor, grid, seed, cache, steps, batch, device):
@@ -189,7 +234,10 @@ def compute_tiles(keys, model, norm, coarse_enc, factor, grid, seed, cache, step
                 return model(x.float(), sg, cin).double()
 
         x = heun_sample(denoise, x0.shape, steps, device=device, initial=x0)
-        out = x[:, 0].cpu().numpy()
+        # Cache complete encoded elevations. Face charts have different coarse
+        # cell centres at an edge; blend their full predictions, not residuals
+        # over a baseline belonging to some other face.
+        out = cond + x[:, 0].cpu().numpy() / sd * s["res_std"]
         for k, arr in zip(chunk, out):
             cache.save(k, arr)
         done = i + len(chunk)
@@ -199,7 +247,7 @@ def compute_tiles(keys, model, norm, coarse_enc, factor, grid, seed, cache, step
 
 
 def blend(keys, grid, cache):
-    """Weighted residual sums over the given tiles, combined across shared edge nodes."""
+    """Weighted encoded elevation sums, combined across shared edge nodes."""
     N, size = grid.N, grid.size
     acc = np.zeros((1, 6, N + 1, N + 1), np.float32)
     wsum = np.zeros((1, 6, N + 1, N + 1), np.float32)
@@ -251,6 +299,8 @@ def main(argv=None):
     a = p.parse_args(argv)
     if a.steps < 8:
         p.error("--steps must be at least 8")
+    if a.batch < 1:
+        p.error("--batch must be positive")
     torch.backends.cudnn.benchmark = False
     torch.backends.cudnn.deterministic = True
     device = pick_device(a.device)
@@ -258,12 +308,14 @@ def main(argv=None):
     model, norm, ck = load_checkpoint(ckpt, device)
     meta = ck["meta"]
     h, factor, size = meta["spacing_m"], meta["factor"], meta["size"]
-    stride = a.stride or size * 3 // 4
+    stride = size * 3 // 4 if a.stride is None else a.stride
+    if not 0 < stride < size or stride % factor:
+        p.error("--stride must be a positive multiple of the model's factor, smaller than its tile")
     quarter = math.pi * a.radius_metres / 2
     n = max(4, int(round(quarter / (h * factor))))
     N = n * factor
     spacing = quarter / N
-    grid = Grid(N, size, stride)
+    grid = Grid(N, size, stride, factor)
 
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
@@ -271,7 +323,10 @@ def main(argv=None):
                 "dem_sha256": file_sha(a.dem), "black_metres": a.black_metres, "white_metres": a.white_metres,
                 "ocean_metres": a.ocean_metres, "radius_metres": a.radius_metres, "seed": a.seed,
                 "steps": a.steps, "tile": size, "stride": stride, "coarse_intervals": n,
-                "fine_intervals": N, "spacing_m": h, "factor": factor, "noise_block": NOISE_BLOCK}
+                "fine_intervals": N, "spacing_m": h, "factor": factor, "noise_block": NOISE_BLOCK,
+                "batch": a.batch, "coarse_halo": grid.coarse_halo,
+                "condition_cell_offset_fine": (factor - 1) / 2,
+                "tile_values": "encoded_elevation"}
     sfile = out / "settings.json"
     if sfile.exists():
         old = json.loads(sfile.read_text())
@@ -279,7 +334,9 @@ def main(argv=None):
         if diff:
             raise SystemExit(f"{out} was made with different settings {diff}; use a new --out folder")
     else:
-        sfile.write_text(json.dumps(dict(settings, dem=a.dem, checkpoint=str(ckpt)), indent=2))
+        temporary = sfile.with_suffix(".tmp.json")
+        temporary.write_text(json.dumps(dict(settings, dem=a.dem, checkpoint=str(ckpt)), indent=2))
+        temporary.replace(sfile)
 
     print(f"device {device}; cube {n} coarse / {N} fine intervals per face "
           f"(~{quarter / n / 1000:.1f} km condition, ~{spacing / 1000:.2f} km nominal); "
@@ -290,9 +347,9 @@ def main(argv=None):
         coarse_m = np.load(cpath)
     else:
         raster = GlobalRaster.from_file(a.dem, a.black_metres, a.white_metres, a.ocean_metres)
-        coarse_m = coarse_condition(raster, n)
-        np.save(cpath, coarse_m)
-    coarse_enc = cube.identify(encode(coarse_m))
+        coarse_m = coarse_condition_cells(raster, n, factor, grid.coarse_halo)
+        save_array(cpath, coarse_m)
+    coarse_enc = encode(coarse_m)
     cache = TileCache(out / "tiles")
 
     if a.bounds:
@@ -345,17 +402,11 @@ def main(argv=None):
         f, y, x = grid.unflat(needed)
         if np.any(wsum[0, f, y, x] <= 0):
             raise RuntimeError("incomplete tile coverage for the requested region")
-        resid = acc[0, f, y, x] / wsum[0, f, y, x]
-        field[0, f, y, x] = up_at(coarse_enc, factor, grid, needed) + resid / norm.sd * norm.s["res_std"]
+        field[0, f, y, x] = acc[0, f, y, x] / wsum[0, f, y, x]
     else:
         if np.any(wsum <= 0):
             raise RuntimeError("incomplete tile coverage")
-        all_nodes = np.arange(6 * (N + 1) ** 2, dtype=np.int64)
-        up = np.empty(all_nodes.shape, np.float32)
-        for start in range(0, len(all_nodes), 1 << 22):
-            sel = all_nodes[start:start + (1 << 22)]
-            up[sel] = up_at(coarse_enc, factor, grid, sel)
-        field = (up.reshape(acc.shape) + acc / wsum / norm.sd * norm.s["res_std"]).astype(np.float32)
+        field = (acc / wsum).astype(np.float32)
     del acc, wsum
     metres_field = decode(field).astype(np.float32)
 
@@ -368,7 +419,12 @@ def main(argv=None):
                 sampling="bilinear from cube nodes at pixel centres")
     preview_rows = []
     pstep = max(1, height // 1024)
-    with rasterio.open(target, "w", driver="GTiff", width=width, height=height, count=1, dtype="float32",
+    # Publish the TIFF only after both exports are complete. Stop during export
+    # leaves a temporary file that a resumed run can safely replace.
+    pending = target.parent / ".incomplete"
+    pending.mkdir(exist_ok=True)
+    temporary_target = pending / target.name
+    with rasterio.open(temporary_target, "w", driver="GTiff", width=width, height=height, count=1, dtype="float32",
                        crs=crs, transform=from_origin(*transform_origin, *px), compress="deflate",
                        predictor=3, tiled=True, BIGTIFF="IF_SAFER") as dst:
         dst.update_tags(AREA_OR_POINT="Area", **{k: str(v) for k, v in tags.items()})
@@ -384,7 +440,10 @@ def main(argv=None):
     import matplotlib.pyplot as plt
     from .evaluate import shaded
     prev = np.concatenate(preview_rows)
-    plt.imsave(target.with_suffix(".preview.png"), shaded(prev, spacing * pstep))
+    temporary_preview = pending / target.with_suffix(".preview.png").name
+    plt.imsave(temporary_preview, shaded(prev, spacing * pstep))
+    temporary_preview.replace(target.with_suffix(".preview.png"))
+    temporary_target.replace(target)
     print(f"wrote {target} and {target.with_suffix('.preview.png').name}")
 
 

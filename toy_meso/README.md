@@ -55,6 +55,18 @@ Same input options as `demo_region` (`--black-metres`, `--white-metres`, `--ocea
 
 ## Whole planet at the model's own spacing (tiled, region-consistent)
 
+Use this generator for `outputs\meso\run2-lowlr\latest.pt`. The current `meso-tiled-v2-cell-centres` sampler matches the training cell-centre alignment without moving the fine output coordinates or adding a resampling shift. The checkpoint itself does not need retraining. The older `toy_meso.planet` consensus generator above does not include this correction.
+
+### Desktop UI for the fixed model
+
+Double-click `Launch Meso.cmd`, or run `.venv\Scripts\python.exe -m toy_meso.gui`. It starts with your `run2-lowlr\latest.pt` checkpoint, `human_input\B2W.png`, black/white elevations of -6000/+6000 m, 32 sampling steps, and 16 tiles per batch. The default output folder is `outputs\meso\planet-ui`.
+
+- Choose a global 2:1 PNG or a single elevation TIFF, the checkpoint, run folder, seed, and whole globe or regional bounds. PNG elevation controls are disabled for TIFF inputs. The optional pure-black ocean elevation uses the sampler's existing `--ocean-metres` behavior; blank means no override.
+- **Advanced settings** contains sampling steps, tile batch size, planet radius, optional tile stride, output height/region width, filename, and device. Blank dimensions use the model's native spacing; whole-globe width is always twice its height. There are no climate, refinement, guide-height, or 30 m / 90 m controls.
+- **Generate / Resume** saves `meso-launch.json` and appends to `generation.log`. **Stop** keeps completed tiles. Intermediate arrays and exports are written to temporary files, so a stopped export can resume with the same settings and filename.
+- **Load settings** accepts `meso-launch.json` or the fixed sampler's `settings.json`. The latter restores cache settings; choose the desired region/dimensions afterwards. New regions can reuse the same folder and tiles with an unused output filename. **New run** chooses a fresh folder while retaining model and input settings.
+- On completion, **Open preview** shows the shaded PNG and **Open folder** opens the results. The main project's `Launch Planet.cmd` continues to launch its original UI.
+
 `planet` above blends all windows at every step, which is fine at 20 km but too heavy at 2.88 km. `planet_tiled` uses a fixed grid of overlapping tiles on the cube instead. Each tile is denoised to completion on its own, from noise keyed to its absolute position on the sphere, and finished tiles are blended (as the upstream coarse stage does). A point depends only on the few tiles covering it, so:
 
 - a region generated on its own is **identical** to the same area of the full planet
@@ -62,16 +74,17 @@ Same input options as `demo_region` (`--black-metres`, `--white-metres`, `--ocea
 
 ```powershell
 # whole planet (2.88 km model: 8,664 tiles; writes planet.tif ~13,900 x 6,950)
-.venv\Scripts\python.exe -m toy_meso.planet_tiled --run outputs\meso\run2-lowlr --dem path\to\sketch.png --black-metres -6000 --white-metres 6000 --out outputs\meso\planetA
+.venv\Scripts\python.exe -m toy_meso.planet_tiled --run outputs\meso\run2-lowlr --dem human_input\B2W.png --black-metres -6000 --white-metres 6000 --out outputs\meso\planet-fixed --steps 32 --batch 16
 
 # just a region (lon/lat box W S E N); same --out folder reuses / adds to the cache
-.venv\Scripts\python.exe -m toy_meso.planet_tiled --run outputs\meso\run2-lowlr --dem path\to\sketch.png --black-metres -6000 --white-metres 6000 --out outputs\meso\planetA --bounds 0 40 20 55 --name region1.tif
+.venv\Scripts\python.exe -m toy_meso.planet_tiled --run outputs\meso\run2-lowlr --dem human_input\B2W.png --black-metres -6000 --white-metres 6000 --out outputs\meso\planet-fixed --steps 32 --batch 16 --bounds 5 44 15 49 --name Alps.tif
 ```
 
 - `--dem` can also be one of your `planet-coarse.tif` files (already at 23 km).
-- The folder's `settings.json` pins the checkpoint, input, black/white values, seed, steps and radius; a different setting needs a new `--out` folder.
+- The folder's `settings.json` pins the checkpoint, input, black/white values, seed, steps, batch size, sampler version and radius; a different setting needs a new `--out` folder. Old v1 folders such as `planetC` are rejected: use a fresh folder to regenerate with v2.
 - `--width/--height` set output pixels (default: native spacing). `--batch` is fixed per run for identical numerics; lower it if GPU memory spills.
-- Outputs: the GeoTIFF, a `.preview.png`, `coarse.npy` (the averaged input) and `tiles\` (cache, ~0.5 GB for a whole 2.88 km planet).
+- Outputs: the GeoTIFF, a `.preview.png`, `coarse.npy` (six cell-centred averaged input charts with halos) and `tiles\` (complete encoded-elevation patches, ~0.5 GB for a whole 2.88 km planet). The v2 coarse arrays are chart cells, not shared cube nodes, and the v2 tile cache contains elevations rather than normalized residuals.
+- Custom `--stride` values must be positive multiples of the model's factor (8 here), smaller than the tile size. The default remains 96 for 128-pixel tiles.
 - Known limit: where tiles overlap (a third of each tile width), two slightly different tile results are averaged, which softens fine detail there by a few percent (measured ~7% lower detail amplitude where both axes overlap, ~2.5% where one does).
 
 ## CPU smoke-test result (already run)
