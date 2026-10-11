@@ -61,10 +61,12 @@ Use this generator for `outputs\meso\run2-lowlr\latest.pt`. The current `meso-ti
 
 Double-click `Launch Meso.cmd`, or run `.venv\Scripts\python.exe -m toy_meso.gui`. It starts with your `run2-lowlr\latest.pt` checkpoint, `human_input\B2W.png`, black/white elevations of -6000/+6000 m, 32 sampling steps, and 16 tiles per batch. The default output folder is `outputs\meso\planet-ui`.
 
-- Choose a global 2:1 PNG or a single elevation TIFF, the checkpoint, run folder, seed, and whole globe or regional bounds. PNG elevation controls are disabled for TIFF inputs. The optional pure-black ocean elevation uses the sampler's existing `--ocean-metres` behavior; blank means no override.
+- Choose **Input map**, **Random terrain**, or **Map + random**. Random terrain needs no map; its layout and finer model detail follow the seed. Mixed mode has a **Map contribution** slider: 0% uses random elevations, 100% uses the map, and intermediate values blend the elevation inputs in metres before the model runs. Transparent PNG areas use random terrain in mixed mode, even at 100% map contribution.
+- Optional **Pause to approve the random layout before generating terrain** saves `random.preview.png` (the random globe) and `input.preview.png` (the averaged input for the selected globe/region, including the map blend). The run then stops before GPU inference. **Open input preview**, then **Approve & Generate** to continue with the same cached input. Leave the checkbox off for continuous generation. Approval is saved in `input-review.json`; changed input settings, area/pixel sampling, or preview images require a fresh review. To reject the layout, use **New run** and another seed.
+- For map or mixed input, choose a global 2:1 PNG or a single elevation TIFF. Then choose the checkpoint, run folder, seed, and whole globe or regional bounds. Map controls are disabled for random terrain, and PNG elevation controls are disabled for TIFF inputs. The optional pure-black ocean elevation uses `--ocean-metres`; blank means no override.
 - **Advanced settings** contains sampling steps, tile batch size, planet radius, optional tile stride, output height/region width, filename, and device. Blank dimensions use the model's native spacing; whole-globe width is always twice its height. There are no climate, refinement, guide-height, or 30 m / 90 m controls.
 - **Generate / Resume** saves `meso-launch.json` and appends to `generation.log`. **Stop** keeps completed tiles. Intermediate arrays and exports are written to temporary files, so a stopped export can resume with the same settings and filename.
-- **Load settings** accepts `meso-launch.json` or the fixed sampler's `settings.json`. The latter restores cache settings; choose the desired region/dimensions afterwards. New regions can reuse the same folder and tiles with an unused output filename. **New run** chooses a fresh folder while retaining model and input settings.
+- **Load settings** accepts `meso-launch.json` or the fixed sampler's `settings.json`, including source and mix settings. The latter restores cache settings; choose the desired region/dimensions afterwards. New regions can reuse the same folder and tiles with an unused output filename. **New run** chooses a fresh folder while retaining model and input settings. Existing map-only v2 runs remain compatible; changing source or mix percentage needs a new run folder.
 - On completion, **Open preview** shows the shaded PNG and **Open folder** opens the results. The main project's `Launch Planet.cmd` continues to launch its original UI.
 
 `planet` above blends all windows at every step, which is fine at 20 km but too heavy at 2.88 km. `planet_tiled` uses a fixed grid of overlapping tiles on the cube instead. Each tile is denoised to completion on its own, from noise keyed to its absolute position on the sphere, and finished tiles are blended (as the upstream coarse stage does). A point depends only on the few tiles covering it, so:
@@ -78,14 +80,39 @@ Double-click `Launch Meso.cmd`, or run `.venv\Scripts\python.exe -m toy_meso.gui
 
 # just a region (lon/lat box W S E N); same --out folder reuses / adds to the cache
 .venv\Scripts\python.exe -m toy_meso.planet_tiled --run outputs\meso\run2-lowlr --dem human_input\B2W.png --black-metres -6000 --white-metres 6000 --out outputs\meso\planet-fixed --steps 32 --batch 16 --bounds 5 44 15 49 --name Alps.tif
+
+# random planet; no input map needed
+.venv\Scripts\python.exe -m toy_meso.planet_tiled --run outputs\meso\run2-lowlr --source random --seed 42 --out outputs\meso\planet-random
+
+# mix 75% map elevations with 25% random elevations
+.venv\Scripts\python.exe -m toy_meso.planet_tiled --run outputs\meso\run2-lowlr --source mixed --map-weight .75 --dem human_input\B2W.png --black-metres -6000 --white-metres 6000 --seed 42 --out outputs\meso\planet-mixed
 ```
 
 - `--dem` can also be one of your `planet-coarse.tif` files (already at 23 km).
-- The folder's `settings.json` pins the checkpoint, input, black/white values, seed, steps, batch size, sampler version and radius; a different setting needs a new `--out` folder. Old v1 folders such as `planetC` are rejected: use a fresh folder to regenerate with v2.
+- `--source map|random|mixed` chooses the elevation input. Without `--source`, a supplied `--dem` selects map input; no `--dem` selects random terrain. `--map-weight` is 0..1 for mixed input (default 0.5). The random guide uses continuous 3-D fractal noise with a fixed continent scale and the main project's elevation distribution; it uses no climate channels or older pretrained models.
+- The folder's `settings.json` pins the checkpoint, input, black/white values, seed, steps, batch size, sampler version and radius; a different setting needs a new `--out` folder. Old v1 sampler folders such as `planetC` are rejected: use a fresh folder to regenerate with the corrected sampler. Existing random-source v1 runs retain their original smooth guide for resuming; **New run** selects the revised multiscale random source.
 - `--width/--height` set output pixels (default: native spacing). `--batch` is fixed per run for identical numerics; lower it if GPU memory spills.
-- Outputs: the GeoTIFF, a `.preview.png`, `coarse.npy` (six cell-centred averaged input charts with halos) and `tiles\` (complete encoded-elevation patches, ~0.5 GB for a whole 2.88 km planet). The v2 coarse arrays are chart cells, not shared cube nodes, and the v2 tile cache contains elevations rather than normalized residuals.
+- Outputs: the GeoTIFF, a `.preview.png`, `coarse.npy` (six cell-centred averaged input charts with halos), `coarse-valid.npy` (which input cells have been prepared), and `tiles\` (complete encoded-elevation patches, ~0.5 GB for a whole 2.88 km planet). Unprepared coarse cells are filled as new regions need them. Older coarse caches without a validity mask are complete and remain compatible. The v2 coarse arrays are chart cells, not shared cube nodes, and the v2 tile cache contains elevations rather than normalized residuals.
 - Custom `--stride` values must be positive multiples of the model's factor (8 here), smaller than the tile size. The default remains 96 for 128-pixel tiles.
 - Known limit: where tiles overlap (a third of each tile width), two slightly different tile results are averaged, which softens fine detail there by a few percent (measured ~7% lower detail amplitude where both axes overlap, ~2.5% where one does).
+
+### Random input structure
+
+The earlier random source used four noise octaves, leaving most land much smoother than the model's Earth training conditions. In the completed `human_input/MESO1` run, the model did run on all 8,664 tiles, but its land additions measured only about 3.4 m RMS across 130 sampled tiles. It therefore resembled the smooth random input even after a full sampling run.
+
+New random/mixed runs use `meso-random-elevation-v2-multiscale`: nine octaves with gain 0.7 and a fixed global noise calibration, retaining broad shapes while adding variation toward the ~23 km input spacing. Across 16 sampled land tiles from the same seed, the model added about 142 m RMS with this guide versus 4 m with the earlier guide. The checkpoint and detail sampler are unchanged. New noise can change coastlines and elevations; use a fresh run rather than mixing versions in an existing cache. Random input still guides the layout, while the trained model supplies finer terrain, so the number of model calls is the same as for an input map.
+
+CLI review: add `--pause-for-input` to a random or mixed run. Exit code 42 means the previews are ready and inference has not started. Rerun the same command with `--approve-input` to approve its unchanged previews and continue. Subsequent resumptions with that approved layout proceed without pausing again.
+
+### Generation speed
+
+The tiled generator prepares only the input cells read by requested tiles. Small regions also blend only the fine nodes needed by the export, instead of allocating fine arrays for the whole planet. Finished tiles and input cells are reused when you resume or export another region. These changes preserve the generated elevations and work automatically through the UI.
+
+GPU inference keeps precision-converted weights cached through each sampling batch and avoids copying step values back to the CPU. Only the selected inference weights move to the GPU; optimizer state and the checkpoint's other weight copy stay in system memory. An export using entirely cached tiles keeps the model on the CPU.
+
+Measured on the RTX 3070 with `run2-lowlr`, 32 steps and batch 16: a fresh 2° × 2° mixed-input region (64 × 64 export, eight tiles) took **7.8 s instead of 28.8 s**, with identical input cells, tiles, and exported elevations. The sampling-only benchmark improved from 5.71 to 5.60 s per 16 tiles, and GPU allocation fell by about 370 MiB. Whole-planet generation still spends most of its time in the model.
+
+For a larger speed change, choose **16 sampling steps** in Advanced settings and **New run**. Sampling measured 2.82 s per 16 tiles, about twice as fast as 32 steps. This changes the terrain: the tested Alps tiles differed by 7.3 m RMS, and fine-scale power increased by about 4–9%. The default stays at 32 steps. Lowering export resolution primarily reduces export work; it does not proportionally reduce the number of model tiles for a whole globe.
 
 ## CPU smoke-test result (already run)
 

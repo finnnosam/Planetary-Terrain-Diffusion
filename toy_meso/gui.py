@@ -1,6 +1,5 @@
 """Desktop controls for the fixed, elevation-only tiled meso generator."""
 from datetime import datetime
-import hashlib
 import json
 import math
 import os
@@ -13,6 +12,9 @@ import sys
 import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
+from .conditioning import (SOURCE_LABELS, file_sha, source_settings, settings_differences,
+                           RANDOM_VERSION, RANDOM_VERSIONS, LEGACY_RANDOM_VERSION)
+from .input_review import REVIEW_EXIT_CODE, INPUT_PREVIEW
 
 ROOT = Path(__file__).resolve().parents[1]
 LAUNCH_VERSION = "meso-ui-v1"
@@ -26,7 +28,8 @@ def default_settings():
                 black="-6000", white="6000", ocean="", scope="Whole globe",
                 west="5", south="44", east="15", north="49", width="", height="",
                 name="", steps="32", batch="16", stride="", radius="6371000",
-                device="auto")
+                device="auto", source="Input map", map_percent="50", review_input="0",
+                random_version=RANDOM_VERSION)
 
 
 def python_executable():
@@ -38,14 +41,6 @@ def python_executable():
 def resolve_path(value):
     path = Path(value).expanduser()
     return (path if path.is_absolute() else ROOT / path).resolve()
-
-
-def file_sha(path):
-    digest = hashlib.sha256()
-    with open(path, "rb") as stream:
-        for block in iter(lambda: stream.read(8 * 1024 * 1024), b""):
-            digest.update(block)
-    return digest.hexdigest()
 
 
 def finite_number(value, label):
@@ -68,32 +63,43 @@ def integer(value, label, minimum=1):
     return number
 
 
-def prepare_command(values):
+def prepare_command(values, approve=False):
     """Validate inputs and existing cache before creating a run or loading a model."""
     settings = default_settings()
     settings.update(values)
-    for key in ("checkpoint", "dem", "folder"):
+    if settings["source"] not in SOURCE_LABELS:
+        raise ValueError("Choose Input map, Random terrain, or Map + random.")
+    source = SOURCE_LABELS[settings["source"]]
+    if settings["review_input"] not in ("0", "1"):
+        raise ValueError("Input review must be on or off.")
+    map_weight = .5
+    if source == "mixed":
+        map_weight = finite_number(settings["map_percent"], "Map percentage") / 100
+        if not 0 <= map_weight <= 1:
+            raise ValueError("Map percentage must be between 0 and 100.")
+    for key in (("checkpoint", "folder") if source == "random" else ("checkpoint", "dem", "folder")):
         if not str(settings[key]).strip():
             raise ValueError(f"Choose a {dict(checkpoint='model checkpoint', dem='map', folder='run folder')[key]}.")
         settings[key] = str(resolve_path(settings[key]))
-    checkpoint, dem, folder = (Path(settings[k]) for k in ("checkpoint", "dem", "folder"))
+    checkpoint, folder = (Path(settings[k]) for k in ("checkpoint", "folder"))
+    dem = Path(settings["dem"]) if source != "random" else None
     if not checkpoint.is_file():
         raise ValueError("The model checkpoint was not found. Choose your .pt file.")
-    if not dem.is_file() or dem.suffix.lower() not in (".png", ".tif", ".tiff"):
+    if dem is not None and (not dem.is_file() or dem.suffix.lower() not in (".png", ".tif", ".tiff")):
         raise ValueError("Choose an existing global PNG or elevation TIFF.")
     if folder.exists() and not folder.is_dir():
         raise ValueError("The run folder points to a file.")
-    if dem.suffix.lower() == ".png":
+    if dem is not None and dem.suffix.lower() == ".png":
         from PIL import Image
         with Image.open(dem) as image:
             width, height = image.size
-    else:
+    elif dem is not None:
         import rasterio
         with rasterio.open(dem) as image:
             width, height = image.width, image.height
             if image.count != 1:
                 raise ValueError("Choose a single-band elevation TIFF in metres.")
-    if height < 2 or width != 2 * height:
+    if dem is not None and (height < 2 or width != 2 * height):
         raise ValueError("The input must be a global map twice as wide as it is tall, with north at the top.")
     seed = integer(settings["seed"], "Seed", 0)
     if seed >= 2**64:
@@ -103,10 +109,10 @@ def prepare_command(values):
     radius = finite_number(settings["radius"], "Planet radius")
     if radius <= 0:
         raise ValueError("Planet radius must be greater than zero.")
-    black = finite_number(settings["black"], "Black elevation")
-    white = finite_number(settings["white"], "White elevation")
-    ocean = finite_number(settings["ocean"], "Pure-black ocean elevation") if settings["ocean"].strip() else None
-    if dem.suffix.lower() == ".png" and white <= black:
+    black = finite_number(settings["black"], "Black elevation") if dem is not None else -2000.
+    white = finite_number(settings["white"], "White elevation") if dem is not None else 4000.
+    ocean = finite_number(settings["ocean"], "Pure-black ocean elevation") if dem is not None and settings["ocean"].strip() else None
+    if dem is not None and dem.suffix.lower() == ".png" and white <= black:
         raise ValueError("White elevation must be greater than black elevation.")
     if settings["device"] not in ("auto", "cpu", "cuda"):
         raise ValueError("Choose Auto, CPU, or CUDA for the device.")
@@ -131,25 +137,40 @@ def prepare_command(values):
     if target.exists():
         raise ValueError(f"{name} already exists. Choose a different output filename, or use New run.")
 
-    pinned = dict(version=SAMPLER_VERSION, checkpoint_sha256=file_sha(checkpoint), dem_sha256=file_sha(dem),
+    cache_settings = folder / "settings.json"
+    old = json.loads(cache_settings.read_text(encoding="utf-8")) if cache_settings.exists() else None
+    random_version = (old or {}).get("random_source_version", settings["random_version"])
+    if random_version not in RANDOM_VERSIONS:
+        raise ValueError("The saved run uses an unsupported random terrain version.")
+    settings["random_version"] = random_version
+    pinned = dict(version=SAMPLER_VERSION, checkpoint_sha256=file_sha(checkpoint),
                   seed=seed, steps=steps, batch=batch, radius_metres=radius,
                   black_metres=black, white_metres=white, ocean_metres=ocean)
-    cache_settings = folder / "settings.json"
+    pinned.update(source_settings(source, dem, map_weight, random_version))
     if cache_settings.exists():
-        old = json.loads(cache_settings.read_text(encoding="utf-8"))
         if stride is not None:
             pinned["stride"] = stride
         elif "tile" in old:
             pinned["stride"] = old["tile"] * 3 // 4
-        changed = [key for key, value in pinned.items() if old.get(key) != value]
+        changed = list(settings_differences(old, pinned))
         if changed:
             raise ValueError("This folder contains tiles made with different settings "
                              f"({', '.join(changed)}). Load its settings to resume, or use New run.")
     cmd = [python_executable(), "-u", "-m", "toy_meso.planet_tiled", "--run", str(checkpoint.parent),
-           "--checkpoint", checkpoint.name, "--dem", str(dem), "--out", str(folder),
+           "--checkpoint", checkpoint.name, "--source", source, "--out", str(folder),
            "--black-metres", str(black), "--white-metres", str(white), "--seed", str(seed),
            "--steps", str(steps), "--batch", str(batch), "--radius-metres", str(radius),
            "--device", settings["device"], "--name", name]
+    if dem is not None:
+        cmd += ["--dem", str(dem)]
+    if source == "mixed":
+        cmd += ["--map-weight", str(map_weight)]
+    if source != "map":
+        cmd += ["--random-version", random_version]
+        if settings["review_input"] == "1":
+            cmd += ["--pause-for-input"]
+            if approve:
+                cmd += ["--approve-input"]
     if ocean is not None:
         cmd += ["--ocean-metres", str(ocean)]
     if bounds:
@@ -191,6 +212,13 @@ def load_settings(path):
             if source in saved:
                 values[key] = "" if saved[source] is None else str(saved[source])
         values["folder"] = str(path.parent)
+        source = saved.get("input_source", "map")
+        if source not in SOURCE_LABELS.values():
+            raise ValueError("The saved run contains an unsupported input source.")
+        values["source"] = next(label for label, value in SOURCE_LABELS.items() if value == source)
+        if source == "mixed":
+            values["map_percent"] = str(100 * saved["map_weight"])
+        values["random_version"] = saved.get("random_source_version", RANDOM_VERSION)
     else:
         raise ValueError("Choose meso-launch.json or settings.json from the fixed meso generator.")
     return values
@@ -209,10 +237,10 @@ class Launcher:
     def __init__(self, root):
         self.root = root
         root.title("Meso Terrain — Fixed Model")
-        root.geometry("960x760")
-        root.minsize(880, 700)
+        root.geometry("960x820")
+        root.minsize(880, 780)
         self.variables = {key: tk.StringVar(value=value) for key, value in default_settings().items()}
-        self.status = tk.StringVar(value="Ready. Choose a map, then generate a globe or region.")
+        self.status = tk.StringVar(value="Ready. Choose an input source, then generate a globe or region.")
         self.events = queue.Queue()
         self.process = None
         self.process_lock = threading.Lock()
@@ -220,9 +248,13 @@ class Launcher:
         self.busy = False
         self.controls = []
         self.png_controls = []
+        self.map_controls = []
         self.bounds_controls = []
         self.preview = None
         self.run_folder = None
+        self.syncing_mix = False
+        self.awaiting_review = False
+        self.review_values = None
 
         style = ttk.Style(root)
         style.configure("Title.TLabel", font=("Segoe UI", 18, "bold"))
@@ -232,19 +264,31 @@ class Launcher:
         main.columnconfigure(0, weight=1)
         main.rowconfigure(8, weight=1)
         ttk.Label(main, text="Meso Terrain", style="Title.TLabel").grid(row=0, column=0, sticky="w")
-        ttk.Label(main, text="Elevation from your map · corrected sampler · cached tiles for resuming",
+        ttk.Label(main, text="Map, random terrain, or a mix · corrected sampler · cached tiles for resuming",
                   style="Hint.TLabel").grid(row=1, column=0, sticky="w", pady=(2, 12))
 
-        inputs = ttk.LabelFrame(main, text="Map and model", padding=10)
+        inputs = ttk.LabelFrame(main, text="Terrain source and model", padding=10)
         inputs.grid(row=2, column=0, sticky="ew")
         inputs.columnconfigure(1, weight=1)
-        self.path_row(inputs, 0, "Input map", "dem", self.browse_map)
-        self.path_row(inputs, 1, "Model checkpoint", "checkpoint", self.browse_checkpoint)
+        source_row = ttk.Frame(inputs)
+        source_row.grid(row=0, column=0, columnspan=3, sticky="ew", pady=(0, 7))
+        ttk.Label(source_row, text="Terrain source").pack(side="left", padx=(0, 10))
+        self.combo(source_row, "source", tuple(SOURCE_LABELS), width=18).pack(side="left")
+        ttk.Label(source_row, text="Map contribution").pack(side="left", padx=(20, 8))
+        self.mix_control = ttk.Scale(source_row, from_=0, to=100, length=200,
+                                     command=self.change_mix)
+        self.mix_control.set(float(self.variables["map_percent"].get()))
+        self.mix_control.pack(side="left")
+        self.controls.append((self.mix_control, "normal"))
+        self.mix_value = tk.StringVar(value="50% map / 50% random")
+        ttk.Label(source_row, textvariable=self.mix_value, width=24).pack(side="left", padx=8)
+        self.map_controls = self.path_row(inputs, 1, "Input map", "dem", self.browse_map)
+        self.path_row(inputs, 2, "Model checkpoint", "checkpoint", self.browse_checkpoint)
         ttk.Label(inputs, text="Global 2:1 PNG or elevation TIFF in metres. The checkpoint determines terrain scale.",
-                  style="Hint.TLabel").grid(row=2, column=0, columnspan=3, sticky="w", pady=(4, 0))
+                  style="Hint.TLabel").grid(row=3, column=0, columnspan=3, sticky="w", pady=(4, 0))
 
         levels = ttk.Frame(inputs)
-        levels.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(9, 0))
+        levels.grid(row=4, column=0, columnspan=3, sticky="ew", pady=(9, 0))
         for column, (label, key) in enumerate((("Black (m)", "black"), ("White (m)", "white"),
                                               ("Pure-black ocean (m)", "ocean"))):
             ttk.Label(levels, text=label).grid(row=0, column=2 * column, padx=(0 if column == 0 else 12, 5))
@@ -252,7 +296,14 @@ class Launcher:
             entry.grid(row=0, column=2 * column + 1)
             self.png_controls.append(entry)
         ttk.Label(inputs, text="PNG only. Leave pure-black ocean blank to use the normal black-to-white mapping.",
-                  style="Hint.TLabel").grid(row=4, column=0, columnspan=3, sticky="w", pady=(5, 0))
+                  style="Hint.TLabel").grid(row=5, column=0, columnspan=3, sticky="w", pady=(5, 0))
+        self.source_hint = tk.StringVar()
+        ttk.Label(inputs, textvariable=self.source_hint, style="Hint.TLabel").grid(
+            row=6, column=0, columnspan=3, sticky="w", pady=(5, 0))
+        self.review_control = ttk.Checkbutton(inputs, text="Pause to approve the random layout before generating terrain",
+                                              variable=self.variables["review_input"], onvalue="1", offvalue="0")
+        self.review_control.grid(row=7, column=0, columnspan=3, sticky="w", pady=(6, 0))
+        self.controls.append((self.review_control, "normal"))
 
         output = ttk.LabelFrame(main, text="Run and area", padding=10)
         output.grid(row=3, column=0, sticky="ew", pady=(10, 0))
@@ -262,7 +313,7 @@ class Launcher:
         row.grid(row=1, column=0, columnspan=3, sticky="w", pady=7)
         ttk.Label(row, text="Seed").pack(side="left", padx=(0, 8))
         self.entry(row, "seed", width=22).pack(side="left")
-        self.button(row, "Random", lambda: self.variables["seed"].set(str(secrets.randbits(32)))).pack(side="left", padx=6)
+        self.button(row, "New seed", lambda: self.variables["seed"].set(str(secrets.randbits(32)))).pack(side="left", padx=6)
         ttk.Label(row, text="Area").pack(side="left", padx=(20, 8))
         self.combo(row, "scope", ("Whole globe", "Region"), width=16).pack(side="left")
         bounds = ttk.Frame(output)
@@ -294,6 +345,8 @@ class Launcher:
         self.combo(self.advanced, "device", ("auto", "cpu", "cuda"), width=18).grid(row=3, column=3, sticky="ew")
         ttk.Label(self.advanced, text="Globe width is twice its height. More export pixels do not change the model's terrain scale.",
                   style="Hint.TLabel").grid(row=4, column=0, columnspan=4, sticky="w", pady=(6, 0))
+        ttk.Label(self.advanced, text="16 steps samples about twice as fast as 32, with a different result. Use New run when changing steps.",
+                  style="Hint.TLabel").grid(row=5, column=0, columnspan=4, sticky="w", pady=(4, 0))
 
         actions = ttk.Frame(main)
         actions.grid(row=6, column=0, sticky="ew", pady=(0, 8))
@@ -324,6 +377,9 @@ class Launcher:
         self.log.configure(yscrollcommand=scroll.set)
         self.variables["scope"].trace_add("write", lambda *_: self.update_controls())
         self.variables["dem"].trace_add("write", lambda *_: self.update_controls())
+        self.variables["source"].trace_add("write", lambda *_: self.update_controls())
+        self.variables["map_percent"].trace_add("write", lambda *_: self.update_mix())
+        self.update_mix()
         self.update_controls()
         root.protocol("WM_DELETE_WINDOW", self.close)
         self.poll_id = root.after(100, self.poll)
@@ -345,16 +401,53 @@ class Launcher:
 
     def path_row(self, parent, row, label, key, command):
         ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", padx=(0, 10), pady=3)
-        self.entry(parent, key).grid(row=row, column=1, sticky="ew", pady=3)
-        self.button(parent, "Browse…", command).grid(row=row, column=2, padx=(8, 0), pady=3)
+        entry = self.entry(parent, key)
+        entry.grid(row=row, column=1, sticky="ew", pady=3)
+        button = self.button(parent, "Browse…", command)
+        button.grid(row=row, column=2, padx=(8, 0), pady=3)
+        return [entry, button]
+
+    def update_mix(self):
+        try:
+            value = float(self.variables["map_percent"].get())
+        except ValueError:
+            self.mix_value.set("Invalid map percentage")
+            return
+        source = self.variables["source"].get()
+        self.mix_value.set("100% map" if source == "Input map" else "100% random" if source == "Random terrain"
+                           else f"{value:g}% map / {100 - value:g}% random")
+        # Loading settings must move the slider as well as its displayed value.
+        if abs(self.mix_control.get() - value) > .001:
+            self.syncing_mix = True
+            try:
+                self.mix_control.set(value)
+            finally:
+                self.syncing_mix = False
+
+    def change_mix(self, value):
+        if not self.syncing_mix:
+            self.variables["map_percent"].set(f"{float(value):.1f}")
 
     def update_controls(self):
         for widget, state in self.controls:
             widget.configure(state="disabled" if self.busy else state)
         self.generate_button.configure(state="disabled" if self.busy else "normal")
+        self.generate_button.configure(text="Approve & Generate" if self.awaiting_review else "Generate / Resume")
         if self.busy:
             return
-        is_png = self.variables["dem"].get().lower().endswith(".png")
+        source = self.variables["source"].get()
+        uses_map = source != "Random terrain"
+        for widget in self.map_controls:
+            widget.configure(state="normal" if uses_map else "disabled")
+        self.mix_control.configure(state="normal" if source == "Map + random" else "disabled")
+        self.review_control.configure(state="normal" if source != "Input map" else "disabled")
+        self.source_hint.set({"Input map": "The input map sets the layout; the model adds finer terrain.",
+                              "Random terrain": "The seed sets a multiscale random layout; the model adds finer terrain.",
+                              "Map + random": "Mix elevations in metres. Transparent PNG areas use random terrain."}.get(source, ""))
+        if source != "Input map" and self.variables["random_version"].get() == LEGACY_RANDOM_VERSION:
+            self.source_hint.set("This saved run uses the earlier smooth random guide. Choose New run for the revised guide.")
+        self.update_mix()
+        is_png = uses_map and self.variables["dem"].get().lower().endswith(".png")
         for widget in self.png_controls:
             widget.configure(state="normal" if is_png else "disabled")
         regional = self.variables["scope"].get() == "Region"
@@ -365,11 +458,11 @@ class Launcher:
         if self.advanced.winfo_ismapped():
             self.advanced.grid_remove()
             self.advanced_button.configure(text="Show advanced settings")
-            self.root.minsize(880, 700)
+            self.root.minsize(880, 780)
         else:
             self.advanced.grid(row=5, column=0, sticky="ew", pady=(0, 10))
             self.advanced_button.configure(text="Hide advanced settings")
-            self.root.minsize(880, 860)
+            self.root.minsize(880, 930)
 
     def browse_map(self):
         path = filedialog.askopenfilename(title="Choose a global input map", initialdir=str(ROOT / "human_input"),
@@ -393,8 +486,12 @@ class Launcher:
         name = datetime.now().strftime("planet-%Y%m%d-%H%M%S") + "-" + secrets.token_hex(2)
         self.variables["folder"].set(str(parent / name))
         self.variables["name"].set("")
+        self.variables["random_version"].set(RANDOM_VERSION)
+        self.awaiting_review = False
+        self.review_values = None
+        self.update_controls()
         self.preview = None
-        self.preview_button.configure(state="disabled")
+        self.preview_button.configure(text="Open preview", state="disabled")
         self.status.set("Fresh run selected. Current model and map settings kept.")
 
     def load(self):
@@ -406,6 +503,8 @@ class Launcher:
             values = load_settings(path)
             for key, value in values.items():
                 self.variables[key].set(value)
+            self.awaiting_review = False
+            self.review_values = None
             self.update_controls()
             self.status.set("Settings loaded. Choose the area and an unused output filename, then Generate / Resume.")
         except (OSError, ValueError, TypeError, AttributeError) as exc:
@@ -421,20 +520,22 @@ class Launcher:
         if self.busy:
             return
         values = {key: value.get() for key, value in self.variables.items()}
+        approve = self.awaiting_review and values == self.review_values
+        self.awaiting_review = False
         self.busy = True
         self.stop_requested.clear()
         self.preview = None
-        self.preview_button.configure(state="disabled")
+        self.preview_button.configure(text="Open preview", state="disabled")
         self.update_controls()
         self.stop_button.configure(state="normal")
         self.status.set("Checking input and saved tiles…")
         self.progress.configure(mode="indeterminate", value=0)
         self.progress.start(15)
-        threading.Thread(target=self.run, args=(values,), daemon=True).start()
+        threading.Thread(target=self.run, args=(values, approve), daemon=True).start()
 
-    def run(self, values):
+    def run(self, values, approve=False):
         try:
-            command, settings, target = prepare_command(values)
+            command, settings, target = prepare_command(values, approve)
             folder = target.parent
             with self.process_lock:
                 if self.stop_requested.is_set():
@@ -453,7 +554,7 @@ class Launcher:
                     log.flush()
                     self.events.put(("line", line))
             code = self.process.wait()
-            self.events.put(("done", code, target))
+            self.events.put(("done", code, target, values))
         except Exception as exc:
             with self.process_lock:
                 if self.process is not None and self.process.poll() is None:
@@ -487,10 +588,18 @@ class Launcher:
                     self.append(event[1])
                     if not self.stop_requested.is_set():
                         messagebox.showerror("Generation settings", event[1])
+                elif event[1] == REVIEW_EXIT_CODE:
+                    self.awaiting_review = True
+                    self.review_values = event[3]
+                    self.preview = event[2].parent / INPUT_PREVIEW
+                    self.preview_button.configure(text="Open input preview", state="normal")
+                    self.progress.configure(mode="determinate", value=0)
+                    self.update_controls()
+                    self.status.set("Input layout ready. Open input preview, then Approve & Generate, or choose New run and another seed.")
                 elif event[1] == 0:
                     self.progress.configure(mode="determinate", maximum=100, value=100)
                     self.preview = event[2].with_suffix(".preview.png")
-                    self.preview_button.configure(state="normal" if self.preview.exists() else "disabled")
+                    self.preview_button.configure(text="Open preview", state="normal" if self.preview.exists() else "disabled")
                     self.status.set(f"Complete: {event[2].name}. Open preview to see the result.")
                 elif self.stop_requested.is_set():
                     self.progress.configure(mode="determinate", value=0)
@@ -506,8 +615,10 @@ class Launcher:
             self.progress.stop()
             self.progress.configure(mode="determinate", maximum=int(count[2]), value=int(count[1]))
             self.status.set(line.replace("tiles ", "Generating tiles ", 1))
-        elif line.startswith("tiles needed"):
+        elif line.startswith("tiles needed") or line.startswith("coarse cells needed"):
             self.status.set(line)
+        elif line.startswith("preparing "):
+            self.status.set(line.capitalize() + "…")
         elif line.startswith("blending") or line.startswith("writing"):
             self.progress.configure(mode="indeterminate", value=0)
             self.progress.start(15)

@@ -30,6 +30,9 @@ from planet_diffusion import cube
 from .common import load_checkpoint, autocast, pick_device
 from .model import heun_sample
 from .sphere import GlobalRaster, encode, decode, to_latlon, EARTH_RADIUS_M
+from .conditioning import (make_source, source_settings, settings_differences,
+                           RANDOM_VERSIONS, RANDOM_VERSION, LEGACY_RANDOM_VERSION)
+from .input_review import prepare_review, REVIEW_EXIT_CODE
 
 VERSION = "meso-tiled-v2-cell-centres"
 NOISE_BLOCK = 64
@@ -161,6 +164,53 @@ def coarse_condition_cells(raster, n, factor, halo, sub=8):
     return out
 
 
+def ensure_coarse_condition(folder, grid, keys, source_factory, sub=8):
+    """Prepare only cells read by requested tiles, retaining them for later regions."""
+    folder = Path(folder)
+    path, valid_path = folder / "coarse.npy", folder / "coarse-valid.npy"
+    if path.exists() and not valid_path.exists():
+        # Existing v2 caches contain the complete globe.
+        return np.load(path)
+    n, halo, factor = grid.N // grid.factor, grid.coarse_halo, grid.factor
+    side = n + 1 + 2 * halo
+    shape = (1, 6, side, side)
+    required = np.zeros(shape[1:], bool)
+    count = grid.size // factor + 2
+    for face, ky, kx in keys:
+        y = grid.starts[ky] // factor - 1 + halo
+        x = grid.starts[kx] // factor - 1 + halo
+        required[face, y:y + count, x:x + count] = True
+    if path.exists():
+        values, valid = np.load(path), np.load(valid_path)
+        if values.shape != shape or valid.shape != shape[1:] or valid.dtype != np.bool_:
+            raise ValueError("The saved coarse input cache has an unexpected shape or mask")
+    else:
+        values, valid = np.zeros(shape, np.float32), np.zeros(shape[1:], bool)
+        # Create the false mask first. Stop between publishing the array and its
+        # updated mask must never make an unfinished array appear complete.
+        save_array(valid_path, valid)
+    missing = required & ~valid
+    print(f"coarse cells needed {required.sum()}, cached {(required & valid).sum()}, "
+          f"to compute {missing.sum()}", flush=True)
+    if not missing.any():
+        return values
+    raster = source_factory()
+    offsets = (np.arange(sub) + .5) / sub - .5
+    centre = (factor - 1) / (2 * factor)
+    for face in range(6):
+        rows, cols = np.nonzero(missing[face])
+        for start in range(0, len(rows), 1024):
+            r, c = rows[start:start + 1024], cols[start:start + 1024]
+            y = (r - halo)[:, None, None] + centre + offsets[None, :, None]
+            x = (c - halo)[:, None, None] + centre + offsets[None, None, :]
+            lat, lon = to_latlon(cube.directions(face, y, x, n))
+            values[0, face, r, c] = raster.sample(lat, lon).mean(axis=(-2, -1))
+    valid |= missing
+    save_array(path, values)
+    save_array(valid_path, valid)
+    return values
+
+
 def condition_at(coarse_enc, factor, grid, face, y, x):
     """Training's cell-centre interpolation at unshifted fine chart coordinates."""
     offset = (factor - 1) / (2 * factor)
@@ -229,11 +279,11 @@ def compute_tiles(keys, model, norm, coarse_enc, factor, grid, seed, cache, step
         x0 = torch.from_numpy(noise)[:, None].to(device=device, dtype=torch.float64)
 
         def denoise(x, sigma):
-            with torch.no_grad(), autocast(device):
-                sg = torch.full((x.shape[0],), float(sigma), device=device)
-                return model(x.float(), sg, cin).double()
+            sg = sigma.to(dtype=torch.float32).expand(x.shape[0])
+            return model(x.float(), sg, cin).double()
 
-        x = heun_sample(denoise, x0.shape, steps, device=device, initial=x0)
+        with torch.no_grad(), autocast(device):
+            x = heun_sample(denoise, x0.shape, steps, device=device, initial=x0)
         # Cache complete encoded elevations. Face charts have different coarse
         # cell centres at an edge; blend their full predictions, not residuals
         # over a baseline belonging to some other face.
@@ -268,6 +318,53 @@ def blend(keys, grid, cache):
     return acc, wsum
 
 
+def blend_region(keys, grid, cache, nodes):
+    """Blend requested nodes in the same order as the dense whole-globe arrays."""
+    _, y, x = grid.unflat(nodes)
+    acc, weights = np.zeros(len(nodes), np.float32), np.zeros(len(nodes), np.float32)
+    window = cube.linear_weight_window(grid.size).astype(np.float32)
+    for face, ky, kx in keys:
+        y0, x0 = grid.starts[ky], grid.starts[kx]
+        first = np.searchsorted(nodes, grid.flat(face, max(0, y0), 0))
+        last = np.searchsorted(nodes, grid.flat(face, min(grid.N + 1, y0 + grid.size), 0))
+        selected = np.arange(first, last)
+        selected = selected[(x[selected] >= x0) & (x[selected] < x0 + grid.size)]
+        iy, ix = y[selected] - y0, x[selected] - x0
+        weight = window[iy, ix]
+        acc[selected] += weight * cache.load((face, ky, kx))[iy, ix]
+        weights[selected] += weight
+    # All entries of a shared physical node are included in nodes. Retain the
+    # dense implementation's member order and float64 accumulation at edges.
+    positions = np.searchsorted(nodes, grid.members_all)
+    present = positions < len(nodes)
+    present[present] &= nodes[positions[present]] == grid.members_all[present]
+    positions, groups = positions[present], grid.ids_all[present]
+    for values in (acc, weights):
+        sums = np.zeros(grid.n_groups, np.float64)
+        np.add.at(sums, groups, values[positions])
+        values[positions] = sums[groups]
+    if np.any(weights <= 0):
+        raise RuntimeError("incomplete tile coverage for the requested region")
+    return decode(acc / weights).astype(np.float32)
+
+
+def sample_region(nodes, values, grid, points):
+    face, y, x = cube.coordinates(points, grid.N)
+    iy, ix = np.floor(y).astype(int), np.floor(x).astype(int)
+    jy, jx = np.minimum(iy + 1, grid.N), np.minimum(ix + 1, grid.N)
+    fy, fx = y - iy, x - ix
+
+    def read(rows, cols):
+        flat = grid.flat(face, rows, cols)
+        positions = np.searchsorted(nodes, flat)
+        if np.any(positions >= len(nodes)) or np.any(nodes[positions] != flat):
+            raise RuntimeError("output sampling requested a node outside the region")
+        return values[positions]
+
+    return ((1 - fy) * ((1 - fx) * read(iy, ix) + fx * read(iy, jx))
+            + fy * ((1 - fx) * read(jy, ix) + fx * read(jy, jx))).astype(np.float32)
+
+
 def file_sha(path, limit=None):
     h = hashlib.sha256()
     with open(path, "rb") as fh:
@@ -280,7 +377,15 @@ def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--run", required=True, help="trained run folder")
     p.add_argument("--checkpoint", default="latest.pt")
-    p.add_argument("--dem", required=True, help="2:1 PNG sketch or 2:1 global elevation GeoTIFF (metres)")
+    p.add_argument("--dem", help="2:1 PNG sketch or 2:1 global elevation GeoTIFF (metres)")
+    p.add_argument("--source", choices=("map", "random", "mixed"),
+                   help="input source (default: map with --dem, otherwise random)")
+    p.add_argument("--map-weight", type=float, default=.5,
+                   help="map contribution for mixed input, 0..1 (default .5); PNG alpha also masks the map")
+    p.add_argument("--random-version", choices=RANDOM_VERSIONS,
+                   help="random source version (existing runs retain their saved version)")
+    p.add_argument("--pause-for-input", action="store_true", help="save input previews and stop until approved")
+    p.add_argument("--approve-input", action="store_true", help="approve the existing unchanged input preview and generate")
     p.add_argument("--black-metres", type=float, default=-2000.0)
     p.add_argument("--white-metres", type=float, default=4000.0)
     p.add_argument("--ocean-metres", type=float)
@@ -297,15 +402,26 @@ def main(argv=None):
     p.add_argument("--batch", type=int, default=16, help="tiles per model call (fixed; lower if GPU memory spills)")
     p.add_argument("--device", default="auto")
     a = p.parse_args(argv)
+    a.source = a.source or ("map" if a.dem else "random")
+    if a.source != "random" and not a.dem:
+        p.error("map and mixed inputs require --dem")
+    if not math.isfinite(a.map_weight) or not 0 <= a.map_weight <= 1:
+        p.error("--map-weight must be between 0 and 1")
+    if a.source == "random":
+        a.dem = None
+        # These controls only interpret PNGs and must not affect a random run.
+        a.black_metres, a.white_metres, a.ocean_metres = -2000., 4000., None
     if a.steps < 8:
         p.error("--steps must be at least 8")
     if a.batch < 1:
         p.error("--batch must be positive")
+    if not 0 <= a.seed < 2**64:
+        p.error("--seed must be an unsigned 64-bit integer")
     torch.backends.cudnn.benchmark = False
     torch.backends.cudnn.deterministic = True
     device = pick_device(a.device)
     ckpt = Path(a.run) / a.checkpoint
-    model, norm, ck = load_checkpoint(ckpt, device)
+    model, norm, ck = load_checkpoint(ckpt, "cpu")
     meta = ck["meta"]
     h, factor, size = meta["spacing_m"], meta["factor"], meta["size"]
     stride = size * 3 // 4 if a.stride is None else a.stride
@@ -320,7 +436,7 @@ def main(argv=None):
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
     settings = {"version": VERSION, "checkpoint_sha256": file_sha(ckpt), "train_step": ck["step"],
-                "dem_sha256": file_sha(a.dem), "black_metres": a.black_metres, "white_metres": a.white_metres,
+                "black_metres": a.black_metres, "white_metres": a.white_metres,
                 "ocean_metres": a.ocean_metres, "radius_metres": a.radius_metres, "seed": a.seed,
                 "steps": a.steps, "tile": size, "stride": stride, "coarse_intervals": n,
                 "fine_intervals": N, "spacing_m": h, "factor": factor, "noise_block": NOISE_BLOCK,
@@ -328,9 +444,11 @@ def main(argv=None):
                 "condition_cell_offset_fine": (factor - 1) / 2,
                 "tile_values": "encoded_elevation"}
     sfile = out / "settings.json"
+    old = json.loads(sfile.read_text()) if sfile.exists() else None
+    random_version = a.random_version or (old or {}).get("random_source_version", RANDOM_VERSION)
+    settings.update(source_settings(a.source, a.dem, a.map_weight, random_version))
     if sfile.exists():
-        old = json.loads(sfile.read_text())
-        diff = {k: (old.get(k), v) for k, v in settings.items() if old.get(k) != v}
+        diff = settings_differences(old, settings)
         if diff:
             raise SystemExit(f"{out} was made with different settings {diff}; use a new --out folder")
     else:
@@ -341,16 +459,8 @@ def main(argv=None):
     print(f"device {device}; cube {n} coarse / {N} fine intervals per face "
           f"(~{quarter / n / 1000:.1f} km condition, ~{spacing / 1000:.2f} km nominal); "
           f"{len(grid.starts)}x{len(grid.starts)} tiles per face, tile {size}, stride {stride}", flush=True)
-
-    cpath = out / "coarse.npy"
-    if cpath.exists():
-        coarse_m = np.load(cpath)
-    else:
-        raster = GlobalRaster.from_file(a.dem, a.black_metres, a.white_metres, a.ocean_metres)
-        coarse_m = coarse_condition_cells(raster, n, factor, grid.coarse_halo)
-        save_array(cpath, coarse_m)
-    coarse_enc = encode(coarse_m)
-    cache = TileCache(out / "tiles")
+    if a.source != "map" and random_version == LEGACY_RANDOM_VERSION:
+        print("This run retains the earlier smooth random guide. Choose New run for the revised multiscale guide.", flush=True)
 
     if a.bounds:
         west, south, east, north = a.bounds
@@ -393,22 +503,42 @@ def main(argv=None):
         keys = grid.covering_tiles(needed)
     else:
         keys = grid.all_tiles()
+    print(f"preparing {a.source} elevation input"
+          + (f" ({100 * a.map_weight:g}% map)" if a.source == "mixed" else ""), flush=True)
+    coarse_m = ensure_coarse_condition(out, grid, keys,
+        lambda: make_source(a.source, a.seed, a.dem, a.black_metres, a.white_metres,
+                             a.ocean_metres, a.map_weight, random_version))
+    coarse_enc = encode(coarse_m)
+    if a.source != "map" or a.pause_for_input or a.approve_input:
+        review = prepare_review(out, settings, grid, coarse_enc, lat, lon, condition_at, a.approve_input)
+        if a.pause_for_input and not review["approved"]:
+            print(f"input review ready: {out / 'input.preview.png'}; "
+                  "paused before terrain generation. Approve this layout to continue.", flush=True)
+            return REVIEW_EXIT_CODE
+    cache = TileCache(out / "tiles")
+    if any(not cache.has(key) for key in keys):
+        model = model.to(device)
     compute_tiles(keys, model, norm, coarse_enc, factor, grid, a.seed, cache, a.steps, a.batch, device)
 
     print("blending tiles", flush=True)
-    acc, wsum = blend(keys, grid, cache)
-    if a.bounds:
-        field = np.zeros_like(acc)
-        f, y, x = grid.unflat(needed)
-        if np.any(wsum[0, f, y, x] <= 0):
-            raise RuntimeError("incomplete tile coverage for the requested region")
-        field[0, f, y, x] = acc[0, f, y, x] / wsum[0, f, y, x]
+    if a.bounds and len(needed) <= 6 * (N + 1)**2 // 8:
+        metres_nodes = blend_region(keys, grid, cache, needed)
+        sample_output = lambda points: sample_region(needed, metres_nodes, grid, points)
     else:
-        if np.any(wsum <= 0):
-            raise RuntimeError("incomplete tile coverage")
-        field = (acc / wsum).astype(np.float32)
-    del acc, wsum
-    metres_field = decode(field).astype(np.float32)
+        acc, wsum = blend(keys, grid, cache)
+        if a.bounds:
+            field = np.zeros_like(acc)
+            f, y, x = grid.unflat(needed)
+            if np.any(wsum[0, f, y, x] <= 0):
+                raise RuntimeError("incomplete tile coverage for the requested region")
+            field[0, f, y, x] = acc[0, f, y, x] / wsum[0, f, y, x]
+        else:
+            if np.any(wsum <= 0):
+                raise RuntimeError("incomplete tile coverage")
+            field = (acc / wsum).astype(np.float32)
+        del acc, wsum
+        metres_field = decode(field).astype(np.float32)
+        sample_output = lambda points: cube.sample(metres_field, points)[0]
 
     print(f"writing {target} ({width} x {height})", flush=True)
     import rasterio
@@ -430,7 +560,7 @@ def main(argv=None):
         dst.update_tags(AREA_OR_POINT="Area", **{k: str(v) for k, v in tags.items()})
         for start in range(0, height, 128):
             rows = np.arange(start, min(height, start + 128))
-            vals = cube.sample(metres_field, pixel_points(rows))[0].astype(np.float32)
+            vals = sample_output(pixel_points(rows)).astype(np.float32)
             dst.write(vals, 1, window=Window(0, start, width, len(rows)))
             keep = rows % pstep == 0
             if keep.any():
@@ -448,4 +578,4 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

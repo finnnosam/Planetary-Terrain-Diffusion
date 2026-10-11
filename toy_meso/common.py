@@ -46,10 +46,12 @@ def build_model(config):
 
 
 def load_checkpoint(path, device="cpu", use_ema=True):
-    ck = torch.load(path, map_location=device, weights_only=False)
-    model = build_model(ck["config"]).to(device)
+    # Generation only needs one set of weights on the GPU. Optimizer state and
+    # the other weight copy in a training checkpoint stay in system memory.
+    ck = torch.load(path, map_location="cpu", weights_only=False)
+    model = build_model(ck["config"])
     model.load_state_dict(ck["ema"] if use_ema else ck["model"])
-    model.eval()
+    model = model.to(device).eval()
     return model, Normalizer(ck["stats"], ck["meta"]["factor"]), ck
 
 
@@ -66,10 +68,11 @@ def sample_patches(model, norm, cond_cells, steps=32, seed=0, device="cpu"):
     up, cin = norm.condition(cond_cells)
     g = torch.Generator(device=device).manual_seed(seed)
     def denoise(x, sigma):
-        with autocast(device):
-            s = torch.full((x.shape[0],), float(sigma), device=device)
-            return model(x.float(), s, cin).double()
-    x = heun_sample(denoise, (cond_cells.shape[0], 1) + up.shape[-2:], steps, g, device)
+        s = sigma.to(dtype=torch.float32).expand(x.shape[0])
+        return model(x.float(), s, cin).double()
+    # Keep converted weights cached across the complete sampling loop.
+    with autocast(device):
+        x = heun_sample(denoise, (cond_cells.shape[0], 1) + up.shape[-2:], steps, g, device)
     return norm.target(x, up), up
 
 

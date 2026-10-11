@@ -156,7 +156,9 @@ def heun_sample(denoise, shape, steps=32, generator=None, device="cpu", initial=
     for i in range(steps):
         d = (x - denoise(x, t[i])) / t[i]
         x_next = x + (t[i + 1] - t[i]) * d
-        if t[i + 1] > 0:
+        # The schedule ends in zero; testing a CUDA scalar here would force a
+        # CPU/GPU synchronization on every step.
+        if i + 1 < steps:
             d2 = (x_next - denoise(x_next, t[i + 1])) / t[i + 1]
             x_next = x + (t[i + 1] - t[i]) * (d + d2) / 2
         x = x_next
