@@ -35,6 +35,7 @@ planet_diffusion/data
 *.pth
 *.ckpt
 *.safetensors
+data/
 
 # Local examples, experiments, and verification material
 human_input/
