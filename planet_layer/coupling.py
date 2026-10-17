@@ -12,6 +12,8 @@ Forcing per Myr interval (t-1, t], sampled bilinearly from the 46 km plate field
     `density_scale` so that broad isostatic uplift matches between the two models (crust 2,830 vs 2,700 kg/m^3);
   * non-load (m, surface motion): on continents the change of dynamic topography along the parcel path; on ocean
     floor the change of the plate layer's own ocean-floor elevation (thermal subsidence, its sediment).
+  "On continents" means continental at both ends of the interval (min of the two sampled fractions), so the
+  ocean-floor channel telescopes: an all-ocean path ends exactly at the plate layer's present ocean floor.
 Initial surface: the plate layer's elevation at the start of the window, at each parcel's position then.
 """
 import json
@@ -119,17 +121,22 @@ def build_forcing(hist, fine, window_myr, out_dir, density_scale=(1-2830./3300.)
     surf = np.lib.format.open_memmap(out/'surface_m.npy', 'w+', np.float32, (W, N))
     p = fine.xyz.copy()
     cont_now = hist.sample(t_end, 'continental', p)
+    c_t = np.clip(cont_now, 0, 1)
     for i in range(W-1, -1, -1):
         t = t0+i+1                                     # interval (t-1, t]
         q = step_back(hist, float(t), p)
-        c = np.clip(hist.sample(float(t), 'continental', p), 0, 1)
+        c_prev = np.clip(hist.sample(float(t-1), 'continental', q), 0, 1)
+        # continental treatment only where the parcel is continental at both ends of the interval: a change of the
+        # crust label (arc or basin turned continent, breakup, a path crossing a coast) then moves the surface by the
+        # plate layer's own elevation change, and the ocean channel telescopes exactly along every path
+        c = np.minimum(c_t, c_prev)
         # collision thickening arrives as one-node pulses at the plate grid: spread over a belt core (conservative)
         thick = hist.sample(float(t), 'tectonic_thickening_m', p, smooth_km)
         dyn = hist.sample(float(t), 'dynamic_topography_m', p)-hist.sample(float(t-1), 'dynamic_topography_m', q)
         zoc = hist.sample(float(t), 'elevation_m', p)-hist.sample(float(t-1), 'elevation_m', q)
         load[i] = (c*thick*density_scale).astype(np.float32)
         surf[i] = (c*dyn+(1-c)*zoc).astype(np.float32)
-        p = q
+        p, c_t = q, c_prev
         progress(f'  forcing {t-1:+.0f} to {t:+.0f} Myr')
     z0 = hist.sample(float(t0), 'elevation_m', p).astype(np.float32)
     orog = hist.sample(t_end, 'orogeny_age_myr', fine.xyz)

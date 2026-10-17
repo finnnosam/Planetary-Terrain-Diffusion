@@ -52,8 +52,9 @@ PARAMS = {
     'subduction_H_cont_m': 1000., 'subduction_d0_cont_km': 250., 'subduction_sigma_cont_km': 120.,
     'arc_H_ocean_m': 300., 'arc_d0_km': 150., 'arc_sigma_km': 50.,
     'arc_to_continent_thick_m': 20000.,
-    # subduction erosion: the trench removes crust from the base of an overriding continent near it (forearc), the
-    # main continental loss balancing arc growth on Earth (~1.3-1.7 km^3/yr); flux = convergence x H_se
+    # subduction erosion: the trench removes crust from the base of the overriding plate near it (forearc), the
+    # main continental loss balancing arc growth on Earth (~1.3-1.7 km^3/yr); flux = convergence x H_se. On oceanic
+    # crust only arc crust above ocean_thick_m can be removed
     'subduction_erosion_H_m': 700., 'subduction_erosion_d0_km': 50., 'subduction_erosion_sigma_km': 40.,
     'sediment_accretion': .3,      # share of trench sediment scraped onto the overriding plate
     # continental rifting: a gap opening between continental crust is stretched continental crust (rift_thinning x its
@@ -568,7 +569,11 @@ class PlateSim:
                 continue
             shape = np.exp(-.5*((d-d0)/sg)**2)/(sg*np.sqrt(2*np.pi))
             out = out+np.where(mask, v*H*shape*dt, 0.)
-        out = np.maximum(out, -.3*w['thick'])
+        # erosion takes at most 30% of a continental column per step; on oceanic crust it removes only arc crust built
+        # above the normal 7 km (an intra-oceanic forearc), never the oceanic basement: unbounded, it dug pits to
+        # -10 km that trailed behind moving trenches (step 7 run)
+        floor = np.where(cont, -.3*w['thick'], -np.clip(w['thick']-p['ocean_thick_m'], 0, None))
+        out = np.maximum(out, floor)
         for key, m in (('subduction_on_continents_m3', cont), ('subduction_on_ocean_arcs_m3', ~cont)):
             self.erosion_totals[key] = self.erosion_totals.get(key, 0.)+float((out*g.area)[m].sum())
         self.erosion_totals['subduction_added_m3'] = self.erosion_totals.get('subduction_added_m3', 0.)+float((out*g.area).sum())
