@@ -119,6 +119,7 @@ class EDMDenoiser(nn.Module):
     def __init__(self, sigma_data=0.5, cond_channels=1, **unet):
         super().__init__()
         self.sigma_data = sigma_data
+        self.cond_channels = cond_channels
         self.net = UNet(in_ch=1 + cond_channels, **unet)
 
     def forward(self, x, sigma, cond):

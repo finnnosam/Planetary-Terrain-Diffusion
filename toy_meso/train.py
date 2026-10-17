@@ -50,12 +50,12 @@ def validation_loss(model, norm, target, cond, device, seeds=8, chunk=16):
     return total / len(sigmas)
 
 
-def save_preview(path, cond, real, generated, up):
+def save_preview(path, cond, real, generated, up, real_label="real"):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     from .sphere import decode
-    rows = [("condition (bilinear)", up), ("generated", generated), ("real", real)]
+    rows = [("condition (bilinear)", up), ("generated", generated), (real_label, real)]
     n = real.shape[0]
     fig, ax = plt.subplots(len(rows), n, figsize=(2 * n, 2 * len(rows) + 0.4))
     for r, (name, arr) in enumerate(rows):

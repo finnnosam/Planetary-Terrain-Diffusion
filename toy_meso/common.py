@@ -41,8 +41,8 @@ class Normalizer:
 
 
 def build_model(config):
-    return EDMDenoiser(sigma_data=0.5, ch=config["ch"], mults=tuple(config["mults"]),
-                       blocks=config["blocks"], dropout=config.get("dropout", 0.0))
+    return EDMDenoiser(sigma_data=0.5, cond_channels=config.get("cond_channels", 1), ch=config["ch"],
+                       mults=tuple(config["mults"]), blocks=config["blocks"], dropout=config.get("dropout", 0.0))
 
 
 def load_checkpoint(path, device="cpu", use_ema=True):
@@ -62,10 +62,16 @@ def autocast(device):
 
 
 @torch.no_grad()
-def sample_patches(model, norm, cond_cells, steps=32, seed=0, device="cpu"):
-    """Generate encoded-elevation patches for (B,1,h,w) encoded condition cells."""
+def sample_patches(model, norm, cond_cells, steps=32, seed=0, device="cpu", detail_cells=None):
+    """Generate encoded-elevation patches for (B,1,h,w) encoded condition cells.
+
+    detail_cells: optional (B,1,h,w) sub-cell detail (toy_meso.detail encoding) for models trained with a
+    detail input; None means unknown, and the model chooses a plausible amount itself."""
     cond_cells = cond_cells.to(device)
     up, cin = norm.condition(cond_cells)
+    if getattr(model, "cond_channels", 1) > 1:
+        from .detail import detail_inputs
+        cin = torch.cat([cin, detail_inputs(norm, detail_cells, cond_cells.shape, device)], 1)
     g = torch.Generator(device=device).manual_seed(seed)
     def denoise(x, sigma):
         s = sigma.to(dtype=torch.float32).expand(x.shape[0])
