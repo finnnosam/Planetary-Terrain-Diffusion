@@ -38,6 +38,11 @@ PARAMS = {
     'cont_ref_thick_m': 38000.,    # continental crust standing at cont_ref_elev_m
     'cont_ref_elev_m': 300.,
     'rho_crust': 2830., 'rho_mantle': 3300., 'rho_water': 1030., 'rho_sediment': 2400.,
+    # sea level from a fixed water inventory (Earth's ocean, Charette & Smith 2010): each elevation is returned relative
+    # to the level that holds this volume, so a deeper or wider ocean lowers the sea instead of drowning continents.
+    # Elevations are first computed on the fixed reference datum (ridges at -2,600 m, cont_ref_elev_m). None = sea
+    # level fixed at the datum (before step 8)
+    'water_volume_km3': 1.335e9,
     'te_m': 30e3,                  # elastic thickness for the elevation (flexural isostasy of crust and sediment)
     'threads': None,               # threads for the spherical-harmonic flexure (None: all cores)
     # coarse erosion: the landscape model's surface processes at the plate grid (calibrated: scripts/calibrate_coarse_erosion)
@@ -61,6 +66,10 @@ PARAMS = {
     # neighbours' thickness, volume taken from them) until it would be thinner than breakup_thick_m; then ocean floor
     'rift_thinning': .6, 'breakup_thick_m': 20000.,
     'mantle': True,                # dynamic topography and hotspots (planet_layer.mantle)
+    # dynamic topography (planet_layer.mantle): std 800 m to spherical-harmonic degree 30 with a flat (slope 1) spectrum,
+    # chosen by the step 8 sweep (sweep-20261017-223508: texture 0.23 vs 0.77 for the old 400 m / degree 12 / slope 2.5;
+    # residual topography on Earth is +-~1 km with power to degree ~30, Hoggard et al. 2016, the high end of estimates)
+    'dyn_std_m': 800., 'dyn_lmax': 30, 'dyn_slope': 1., 'dt_knot_myr': 40.,
     # plate splitting (Poisson events). Rifting: rate per Myr for a 100 Mkm^2 plate, scaled by area and doubled for
     # mostly continental plates; the split line prefers old sutures; halves diverge at split_speed_cm_yr.
     'split_rate_per_myr': .006, 'split_min_area_mkm2': 12., 'split_speed_cm_yr': 2., 'suture_weakness': .6,
@@ -74,9 +83,19 @@ PARAMS = {
     # sediment-filled ocean floor becomes continental crust (margin prisms, filled remnant basins), keeping its
     # elevation: oceanic nodes with more than basin_to_continent_sed_m of sediment, or any sediment above sea level
     'basin_to_continent_sed_m': 10000.,
-    'crust_kappa_m2_yr': 1000.,    # lateral spreading of continental crust, m^2/yr, at normal thickness ...
-    'collapse_thick_m': 45000.,    # ... rising e-fold per collapse_scale_m above this (gravitational collapse of thick
-    'collapse_scale_m': 6000.,     #     crust keeps plateaus near ~70 km, as Tibet and the Altiplano)
+    # off since step 8: the conversion set the new continental thickness to match the node's elevation, not its mass
+    # (1 km of sediment could become ~30 km of crust); over 250 Myr it added continent over 12.8% of the surface,
+    # thinned the mean continental crust from 38.5 to 34.9 km and hid a ~30% continental volume loss. Thick fills now
+    # stay sediment on oceanic crust, as in the South Caspian or the Gulf of Mexico
+    'basin_to_continent': False,
+    # lateral spreading of continental crust (m^2/yr): kappa_normal everywhere, plus gravitational collapse of thick
+    # (hot, weak) crust, crust_kappa * (exp((T - collapse_thick) / collapse_scale) - 1) up to collapse_max_factor x
+    # crust_kappa, which keeps plateaus near ~70 km as Tibet and the Altiplano. Cold crust of normal thickness barely
+    # flows: kappa_normal = 1000 erased all 100 km crustal structure within ~10 Myr (step 8 texture check)
+    'crust_kappa_normal_m2_yr': 1000.,
+    'crust_kappa_m2_yr': 1000.,
+    'collapse_thick_m': 45000.,
+    'collapse_scale_m': 6000.,
     'collapse_max_factor': 200.,
     'v_min_cm_yr': 1.5, 'v_slab_cm_yr': 9.,  # plate speed without / with a full slab
     'slab_ref_km': 6000.,          # trench length giving the full slab-pull speed
@@ -104,6 +123,19 @@ def isostatic_elevation(cont, thick, ocean_age, p=PARAMS):
     dry = p['cont_ref_elev_m']+(thick-p['cont_ref_thick_m'])*(p['rho_mantle']-p['rho_crust'])/p['rho_mantle']
     wet = np.where(dry < 0, dry*p['rho_mantle']/(p['rho_mantle']-p['rho_water']), dry)
     return np.where(cont, wet, -gdh1_depth(ocean_age))
+
+
+def sea_level_for_volume(z, area, volume_m3):
+    """Level s (m) at which the water below it, sum of (s - z) * area over z < s, equals volume_m3."""
+    order = np.argsort(z)
+    zs, a = z[order], area[order]
+    ca = np.cumsum(a); cza = np.cumsum(zs*a)
+    held = zs*ca-cza                                  # volume below level zs[k] (the k+1 lowest nodes flooded)
+    k = int(np.searchsorted(held, volume_m3))
+    if k == 0:
+        return float(zs[0])
+    k = min(k, len(zs))
+    return float((volume_m3+cza[k-1])/ca[k-1])
 
 
 @njit(cache=True)
@@ -259,7 +291,8 @@ class PlateSim:
                                                 nthreads=self.p['threads'])
         self.flex_wet = SphereFlexure.for_graph(graph, self.p['te_m'], rho_load=1.,
                                                 rho_mantle=self.p['rho_mantle']-self.p['rho_water'], nthreads=self.p['threads'])
-        self.mantle = Mantle(graph, np.random.default_rng([seed, 7]), t0) if self.p['mantle'] else None
+        mp = {k: self.p[k] for k in ('dyn_std_m', 'dyn_lmax', 'dyn_slope', 'dt_knot_myr')}
+        self.mantle = Mantle(graph, np.random.default_rng([seed, 7]), t0, params=mp) if self.p['mantle'] else None
         self.dyn = self.mantle.topography(t0) if self.mantle else np.zeros(graph.size)
         self.next_id = 0
         self.plates = []
@@ -452,9 +485,12 @@ class PlateSim:
         th = before
         T = dt*1e6
         while T > 0:                                     # nonlinear: substeps follow the current largest diffusivity
-            kap = p['crust_kappa_m2_yr']*np.minimum(np.exp(np.clip(th-p['collapse_thick_m'], 0, None)/p['collapse_scale_m']),
-                                                    p['collapse_max_factor'])
-            h = min(T, .9/(kap[w['cont']].max()*self.bound) if w['cont'].any() else T)
+            kap = p['crust_kappa_normal_m2_yr']+p['crust_kappa_m2_yr']*np.minimum(
+                np.expm1(np.clip(th-p['collapse_thick_m'], 0, None)/p['collapse_scale_m']), p['collapse_max_factor'])
+            kmax = kap[w['cont']].max() if w['cont'].any() else 0.
+            if kmax <= 0:
+                break
+            h = min(T, .9/(kmax*self.bound))
             th = gl.diffuse_variable(th, w['cont'], kap, h, g.nbr, g.dist, g.axis, g.area)
             T -= h
         dthick = th-before+rift_dthick
@@ -526,9 +562,11 @@ class PlateSim:
         """Oceanic nodes carrying more than basin_to_continent_sed_m of sediment, or sediment above sea level, become
         continental crust. Its thickness is set so the node keeps its present elevation (the isostatic equivalent)."""
         g, p, w = self.g, self.p, self.world
+        dT = np.zeros(g.size); dS = np.zeros(g.size)
+        if not p['basin_to_continent']:
+            return dT, dS
         z = self.elevation()
         conv = (~w['cont']) & ((w['sed'] > p['basin_to_continent_sed_m']) | ((w['sed'] > 500.) & (z > 0)))
-        dT = np.zeros(g.size); dS = np.zeros(g.size)
         if not conv.any():
             return dT, dS
         rm, rc, rw = p['rho_mantle'], p['rho_crust'], p['rho_water']
@@ -623,14 +661,19 @@ class PlateSim:
         rc, rm, rw, rs = p['rho_crust'], p['rho_mantle'], p['rho_water'], p['rho_sediment']
         anomaly = np.where(cont, thick-p['cont_ref_thick_m'], thick-p['ocean_thick_m'])
         ocean_age = np.where(cont, 0., self.t-w['born'])
-        above = (-gdh1_depth(ocean_age)+anomaly+sed) > 0        # oceanic crust built above sea level (arcs, fills)
+        s0 = getattr(self, 'sea_level', 0.)                     # previous sea level on the datum (loads use it)
+        above = (-gdh1_depth(ocean_age)+anomaly+sed) > s0       # oceanic crust built above sea level (arcs, fills)
         dry = np.where(cont, rc*anomaly, np.where(above, rc*anomaly+rs*sed, 0.))
         wet = np.where(cont | above, 0., (rc-rw)*anomaly+(rs-rw)*sed)
         defl = self.flex_dry.deflection(dry)+self.flex_wet.deflection(wet)
         z = np.where(cont, p['cont_ref_elev_m']+anomaly, -gdh1_depth(ocean_age)+anomaly+sed)-defl
-        own_airy = p['cont_ref_elev_m']+anomaly*(rm-rc)/rm
+        own_airy = p['cont_ref_elev_m']+anomaly*(rm-rc)/rm-s0
         z = z+np.where(cont & (own_airy < 0), own_airy*rw/(rm-rw), 0.)
-        return z+self.dyn                                 # dynamic topography: non-load surface motion
+        z = z+self.dyn                                    # dynamic topography: non-load surface motion
+        if p['water_volume_km3'] is None:
+            return z
+        self.sea_level = sea_level_for_volume(z, self.g.area, p['water_volume_km3']*1e9)
+        return z-self.sea_level
 
     def _update_rasters(self, dthick, idx, dsed=None):
         """Update every plate raster after a step.
@@ -936,6 +979,7 @@ class PlateSim:
                 'convergence_mm_yr': (self.conv_rate*1e3).astype(np.float32) if hasattr(self, 'conv_rate') else np.zeros(self.g.size, np.float32),
                 'elevation_m': elev.astype(np.float32), 'sediment_m': w['sed'].astype(np.float32),
                 'dynamic_topography_m': self.dyn.astype(np.float32), 'new_crust': self.new_crust,
+                'sea_level_m': np.float32(getattr(self, 'sea_level', 0.)),
                 'tectonic_thickening_m': getattr(self, 'tectonic', np.zeros(self.g.size)).astype(np.float32)}
 
     def plate_table(self):

@@ -10,7 +10,8 @@ Forcing per Myr interval (t-1, t], sampled bilinearly from the 46 km plate field
   * load (m of rock, flexurally compensated by the landscape model): the plate layer's tectonic thickening
     (subduction, collision, rifting, volcanism, crust spreading; not its erosion), on continental crust, scaled by
     `density_scale` so that broad isostatic uplift matches between the two models (crust 2,830 vs 2,700 kg/m^3);
-  * non-load (m, surface motion): on continents the change of dynamic topography along the parcel path; on ocean
+  * non-load (m, surface motion): on continents the change of dynamic topography along the parcel path, less the
+    change of the plate layer's sea level (fixed water inventory); on ocean
     floor the change of the plate layer's own ocean-floor elevation (thermal subsidence, its sediment).
   "On continents" means continental at both ends of the interval (min of the two sampled fractions), so the
   ocean-floor channel telescopes: an all-ocean path ends exactly at the plate layer's present ocean floor.
@@ -75,6 +76,11 @@ class PlateHistory:
             v = gl.diffuse(v, dom, total/steps, 1., g.nbr, g.dist, g.axis, g.area)
         return v
 
+    def sea_level(self, t):
+        """The plate layer's sea level on its reference datum at t (0 for runs before the water inventory)."""
+        f, _ = self.fields(t)
+        return float(f['sea_level_m']) if 'sea_level_m' in f else 0.
+
     def owner(self, t, p):
         f, _ = self.fields(t)
         return f['plate_id'][fields.nearest_nodes(self.g, p)]
@@ -133,6 +139,7 @@ def build_forcing(hist, fine, window_myr, out_dir, density_scale=(1-2830./3300.)
         # collision thickening arrives as one-node pulses at the plate grid: spread over a belt core (conservative)
         thick = hist.sample(float(t), 'tectonic_thickening_m', p, smooth_km)
         dyn = hist.sample(float(t), 'dynamic_topography_m', p)-hist.sample(float(t-1), 'dynamic_topography_m', q)
+        dyn = dyn-(hist.sea_level(float(t))-hist.sea_level(float(t-1)))   # land relative to the sea (water inventory)
         zoc = hist.sample(float(t), 'elevation_m', p)-hist.sample(float(t-1), 'elevation_m', q)
         load[i] = (c*thick*density_scale).astype(np.float32)
         surf[i] = (c*dyn+(1-c)*zoc).astype(np.float32)
