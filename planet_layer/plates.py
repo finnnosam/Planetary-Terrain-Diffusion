@@ -47,29 +47,39 @@ PARAMS = {
     'threads': None,               # threads for the spherical-harmonic flexure (None: all cores)
     # coarse erosion: the landscape model's surface processes at the plate grid (calibrated: scripts/calibrate_coarse_erosion)
     'erosion': True, 'erosion_substeps': 4,
-    'erosion_K_factor': 1., 'erosion_Sc': .05, 'erosion_Kd_factor': 4.,
+    'erosion_K_factor': .75, 'erosion_Sc': .05, 'erosion_Kd_factor': 4.,   # K 0.75: sweep-20261018-164500
     'erosion_theta': 8.,           # incision threshold (A^m S at 46 km), calibrated at n=217 against ETOPO (plan doc)
     'stable_erodibility': .15,     # old crust relative to fresh orogens (as the test bed)
     'orogen_erodibility_tau_myr': 50.,
     # subduction zones (overriding plate): thickening flux per unit trench length = convergence rate x H, spread as a
     # Gaussian band at distance d0 from the trench. Continental margins: shortening + arc magmatism (Andes ~3 km x v,
     # quieter margins much less); oceanic: island arcs, which become continental crust once thick enough.
-    'subduction_H_cont_m': 1000., 'subduction_d0_cont_km': 250., 'subduction_sigma_cont_km': 120.,
+    # continental margins: Andes-type belts (sweep-20261018-144253; was 1,000 m at 250 +- 120 km, broad low swells)
+    'subduction_H_cont_m': 2500., 'subduction_d0_cont_km': 150., 'subduction_sigma_cont_km': 60.,
     'arc_H_ocean_m': 300., 'arc_d0_km': 150., 'arc_sigma_km': 50.,
     'arc_to_continent_thick_m': 20000.,
     # subduction erosion: the trench removes crust from the base of the overriding plate near it (forearc), the
     # main continental loss balancing arc growth on Earth (~1.3-1.7 km^3/yr); flux = convergence x H_se. On oceanic
     # crust only arc crust above ocean_thick_m can be removed
     'subduction_erosion_H_m': 700., 'subduction_erosion_d0_km': 50., 'subduction_erosion_sigma_km': 40.,
-    'sediment_accretion': .3,      # share of trench sediment scraped onto the overriding plate
+    # share of trench sediment scraped onto the overriding plate; 0.75 gives a sediment subduction of ~1.2 km^3/yr,
+    # near Earth's ~1.65 (Clift 2017; Scholl & von Huene 2009). At 0.3 it was 2.5-6.4 km^3/yr
+    'sediment_accretion': .75,
     # continental rifting: a gap opening between continental crust is stretched continental crust (rift_thinning x its
     # neighbours' thickness, volume taken from them) until it would be thinner than breakup_thick_m; then ocean floor
     'rift_thinning': .6, 'breakup_thick_m': 20000.,
+    # the volume for a rift gap comes from continental crust within rift_width_km of it (linear taper), not only
+    # from its direct neighbours, so rifted margins thin over a necking zone (Earth: ~50-200 km) instead of one cell
+    'rift_width_km': 0.,
+    # pelagic (biogenic and wind-blown) sediment on the ocean floor, m/Myr (Earth's deep sea ~1-10; GlobSed mean
+    # thickness ~0.5 km); without it the planet's ocean floor carried ~0.1 km of sediment and stood 150-300 m too deep
+    'pelagic_m_myr': 0.,
     'mantle': True,                # dynamic topography and hotspots (planet_layer.mantle)
     # dynamic topography (planet_layer.mantle): std 800 m to spherical-harmonic degree 30 with a flat (slope 1) spectrum,
     # chosen by the step 8 sweep (sweep-20261017-223508: texture 0.23 vs 0.77 for the old 400 m / degree 12 / slope 2.5;
     # residual topography on Earth is +-~1 km with power to degree ~30, Hoggard et al. 2016, the high end of estimates)
-    'dyn_std_m': 800., 'dyn_lmax': 30, 'dyn_slope': 1., 'dt_knot_myr': 40.,
+    # (sweep-20261018-144253, scored with arrangement and budget too, then preferred 500 m)
+    'dyn_std_m': 500., 'dyn_lmax': 30, 'dyn_slope': 1., 'dt_knot_myr': 40.,
     # plate splitting (Poisson events). Rifting: rate per Myr for a 100 Mkm^2 plate, scaled by area and doubled for
     # mostly continental plates; the split line prefers old sutures; halves diverge at split_speed_cm_yr.
     'split_rate_per_myr': .006, 'split_min_area_mkm2': 12., 'split_speed_cm_yr': 2., 'suture_weakness': .6,
@@ -515,6 +525,10 @@ class PlateSim:
             dthick = dthick+e_cont
             th = th+e_cont
         w['thick'] = th
+        if p['pelagic_m_myr'] > 0:
+            pel = np.where(w['cont'], 0., p['pelagic_m_myr']*dt)
+            dsed = dsed+pel
+            self.erosion_totals['pelagic_m3'] = self.erosion_totals.get('pelagic_m3', 0.)+float((pel*g.area).sum())
         w['sed'] = w['sed']+dsed
         conv_t, conv_s = self._sediment_basins_to_continent()
         dthick = dthick+conv_t
@@ -548,9 +562,17 @@ class PlateSim:
             return out
         r, Tr, cr = rows[rift], Tg[rift], cn[rift]
         a = g.area
-        share = (Tr*a[r]/ncont[rift])[:, None]*cr          # volume each continental neighbour gives (m^3)
-        take = np.zeros(g.size)
-        np.add.at(take, nbs[rift][cr], share[cr])
+        if p['rift_width_km'] > 0:                       # necking zone: the volume comes from a tapered band
+            src = np.zeros(g.size, bool); src[r] = True
+            D = max(p['rift_width_km']*1e3, 1.5*float(g.dist[g.nbr >= 0].max()))   # at least the direct neighbours
+            d = gl.distance_to(src, g.nbr, g.dist, D)
+            band = w['cont'] & ~gap & (d < D)
+            wt = np.where(band, (1-d/D)*a, 0.)
+            take = (Tr*a[r]).sum()*wt/max(wt.sum(), 1e-9)
+        else:
+            share = (Tr*a[r]/ncont[rift])[:, None]*cr      # volume each continental neighbour gives (m^3)
+            take = np.zeros(g.size)
+            np.add.at(take, nbs[rift][cr], share[cr])
         out = -np.minimum(take/a, .5*w['thick'])
         w['cont'][r] = True
         w['thick'][r] = Tr
@@ -704,6 +726,8 @@ class PlateSim:
             np.add.at(dVc, wn[sg], p['sediment_accretion']*pl.sed[sg].astype(np.float64)*a[sg])
             self.erosion_totals['sediment_accreted_m3'] = self.erosion_totals.get('sediment_accreted_m3', 0.)+float(
                 (p['sediment_accretion']*pl.sed[sg]*a[sg]).sum())
+            self.erosion_totals['sediment_subducted_m3'] = self.erosion_totals.get('sediment_subducted_m3', 0.)+float(
+                ((1-p['sediment_accretion'])*pl.sed[sg]*a[sg]).sum())
             L = self.ledger
             L['collision_out'] -= float((pl.thick[cc]*a[cc]).sum())
             lost = gone & pl.cont & ~w['cont'][wn]
