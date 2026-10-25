@@ -221,12 +221,22 @@ def distance_to(source, nbr, dist, cutoff=np.inf):
     return d
 
 
-@njit(cache=True)
 def marine_sediment(z, ocean, sea_in, nbr, dist, cell_area, shelf_depth, shelf_gradient, dist_to_land, shelf_width):
-    """Sediment entering the sea moves downslope underwater to a graded shelf surface (see landscape_evolution)."""
+    """Sediment entering the sea moves downslope underwater to a graded shelf surface (see landscape_evolution).
+    What finds no room on the shelf leaves the domain ("goes to the deep sea"): right for an open regional window,
+    a mass sink on a closed planet (see marine_sediment_kept)."""
+    return marine_sediment_kept(z, ocean, sea_in, nbr, dist, cell_area, shelf_depth, shelf_gradient, dist_to_land,
+                                shelf_width)[0]
+
+
+@njit(cache=True)
+def marine_sediment_kept(z, ocean, sea_in, nbr, dist, cell_area, shelf_depth, shelf_gradient, dist_to_land, shelf_width):
+    """marine_sediment, also returning the volume (m^3) that found no room, at the node where its path ended (a
+    local low of the sea floor beyond the shelf)."""
     n = z.shape[0]
     flux = sea_in.copy()
     dep = np.zeros(n)
+    left = np.zeros(n)
     heap = [(0.0, -1)]
     heap.pop()
     for i in range(n):
@@ -259,8 +269,87 @@ def marine_sediment(z, ocean, sea_in, nbr, dist, cell_area, shelf_depth, shelf_g
             # volume moves to the receiving node
             flux[best] += flux[i]
             heapq.heappush(heap, (-(z[best]+dep[best]), best))
+        else:
+            left[i] += flux[i]
         flux[i] = 0.
-    return dep
+    return dep, left
+
+
+@njit(cache=True)
+def fill_and_spill(z, vol, nbr, cell_area):
+    """Place volumes vol (m^3, at sea-floor lows: marine_sediment_kept's leftover) by filling depressions from the
+    bottom up: the deposit ponds at the lowest open level (a priority flood from the node), raising the pond to the
+    next lowest neighbour until the volume is used; where the pond reaches a lower neighbour it spills, and the rest
+    runs down the steepest path from there and ponds again. Turbidites fill abyssal plains and basins this way; the
+    surface stays continuous and every m^3 is placed. Returns the new surface."""
+    n = z.shape[0]
+    z = z.copy()
+    stamp = np.zeros(n, np.int64)
+    lake = np.empty(n, np.int64)
+    run = 0
+    order = np.argsort(-vol)
+    for k in range(n):
+        p = order[k]
+        V = vol[p]
+        if V <= 0.:
+            break
+        guard = 0
+        while V > 0. and guard < 10000:
+            guard += 1
+            # walk down to a local low
+            moved = True
+            while moved:
+                moved = False
+                best = p
+                for m in range(nbr.shape[1]):
+                    j = nbr[p, m]
+                    if j >= 0 and z[j] < z[best]:
+                        best = j
+                if best != p:
+                    p = best
+                    moved = True
+            run += 1
+            stamp[p] = run
+            nl = 1
+            lake[0] = p
+            A = cell_area[p]
+            level = z[p]
+            heap = [(0.0, -1)]
+            heap.pop()
+            for m in range(nbr.shape[1]):
+                j = nbr[p, m]
+                if j >= 0 and stamp[j] != run:
+                    stamp[j] = run
+                    heapq.heappush(heap, (z[j], j))
+            spill = -1
+            while V > 0. and len(heap) > 0:
+                hq, q = heapq.heappop(heap)
+                if hq < level:                       # overflow point: the rest runs down from q
+                    spill = q
+                    break
+                need = (hq-level)*A
+                if V <= need:
+                    level += V/A
+                    V = 0.
+                    break
+                V -= need
+                level = hq
+                lake[nl] = q
+                nl += 1
+                A += cell_area[q]
+                for m in range(nbr.shape[1]):
+                    j = nbr[q, m]
+                    if j >= 0 and stamp[j] != run:
+                        stamp[j] = run
+                        heapq.heappush(heap, (z[j], j))
+            if V > 0. and spill < 0:                 # the whole graph is one pond (not on a planet)
+                level += V/A
+                V = 0.
+            for i in range(nl):
+                z[lake[i]] = level
+            if spill >= 0:
+                p = spill
+    return z
 
 
 @njit(cache=True)
@@ -311,10 +400,12 @@ def diffuse_variable(z, domain, kappa, dt, nbr, dist, axis, cell_area):
     return out
 
 
-def surface_step(g, z, sea_seed, edge_outlets, fallback, K, p, dt, h_min, bound, tick=None, start=None):
+def surface_step(g, z, sea_seed, edge_outlets, fallback, K, p, dt, h_min, bound, tick=None, start=None, keep_deep=False):
     """One step of the surface processes on a graph, without tectonic forcing or flexure: open sea, priority flood,
     D8 routing, Yuan erosion-deposition with lakes, marine sediment (deltas, graded shelves), hillslope and marine
-    diffusion. Returns the new surface and the routing state. Used by GraphLandscape and the plate layer."""
+    diffusion. Returns the new surface and the routing state. Used by GraphLandscape and the plate layer.
+    keep_deep: also return 'deep_m3', the sediment that found no room on the shelves, at the sea-floor low where its
+    path ended (the regional model drops it; a closed planet must place it: the plate layer spreads it as fans)."""
     c = time.perf_counter() if start is None else start
     tick = tick or (lambda key, c0: time.perf_counter())
     ocean = connected_ocean(z, sea_seed, g.nbr)
@@ -326,8 +417,8 @@ def surface_step(g, z, sea_seed, edge_outlets, fallback, K, p, dt, h_min, bound,
     zn, eroded, deposited, sea_in = erode_and_deposit(z, zf, ocean, rec, dist, stack, area, K, p['m'], p['G'], p['Sc'], dt,
                                                       g.area, p['lake_tolerance'], 6, p.get('theta', 0.))
     c = tick('erosion', c)
-    marine = marine_sediment(zn, ocean, sea_in, g.nbr, g.dist, g.area, p['shelf_depth'], p['shelf_gradient'],
-                             distance_to(~ocean, g.nbr, g.dist, p['shelf_width']), p['shelf_width'])
+    marine, deep = marine_sediment_kept(zn, ocean, sea_in, g.nbr, g.dist, g.area, p['shelf_depth'], p['shelf_gradient'],
+                                        distance_to(~ocean, g.nbr, g.dist, p['shelf_width']), p['shelf_width'])
     zn = zn+marine; deposited = deposited+marine
     c = tick('marine', c)
     land = ~ocean
@@ -342,8 +433,11 @@ def surface_step(g, z, sea_seed, edge_outlets, fallback, K, p, dt, h_min, bound,
     moved = zn-before
     deposited = deposited+np.maximum(moved, 0.); eroded = eroded+np.maximum(-moved, 0.)
     c = tick('diffusion', c)
-    return {'z': zn, 'eroded': eroded, 'deposited': deposited, 'ocean': ocean, 'outlet': outlets, 'zf': zf, 'rec': rec,
-            'dist': dist, 'stack': stack, 'area': area, 'clock': c}
+    out = {'z': zn, 'eroded': eroded, 'deposited': deposited, 'ocean': ocean, 'outlet': outlets, 'zf': zf, 'rec': rec,
+           'dist': dist, 'stack': stack, 'area': area, 'clock': c}
+    if keep_deep:
+        out['deep_m3'] = deep
+    return out
 
 
 class FlatFlexure:
