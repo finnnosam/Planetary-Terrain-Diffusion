@@ -269,6 +269,15 @@ PARAMS = {
     #    and speeds up, and the mean follows the parent (pre-check, thirty-first pass: area-weighted plate speed 7-9
     #    cm/yr against the control's 3-4, collisions consumed 2x the continent)
     'ext_pair_motion': 'union',
+    # E4 (thirty-second pass, agreed 25 Oct): which side of a band cut moves.
+    #  * ext_side 'free': the side that faces a free boundary. For each side of the cut, its far edge is its nodes next
+    #    to another plate; the side whose far edge has the smaller share of collision-boundary nodes becomes the
+    #    microplate. Gravitational spreading extends toward a free boundary; the side pushed against a collision cannot
+    #    open (Rey, Vanderhaeghe & Teyssier 2001, Tectonophysics 342: the free-boundary mode needs an unconfined edge).
+    #    Equal shares (two free sides, or both on collisions) and a side with no far edge go to the smaller area. No new
+    #    number. 'smaller' (E3 as built): the smaller side moves; in the E3 sweep 48-62% of its microplates had a far
+    #    edge mostly on a collision and 60-70% of its events ended with a half docked (thirty-second pass)
+    'ext_side': 'free',
     # thickness of the supercontinent's crust at the start (twenty-fourth pass). 'assumed' (until now): 37.5 km + 2 km
     # beyond 300 km from old sutures + 4 km near them + a +-1.5 km field (interior p50 39.2-40.1 km, p10-p90 3-4 km
     # wide); it survives 250 Myr almost untouched (95-99% of the present interior, twenty-third pass). 'earth': the
@@ -286,6 +295,17 @@ PARAMS = {
     'collision_ref_km': 1500.,     # collision length that halves the target speed
     'tau_speed_myr': 10., 'tau_axis_myr': 20.,
     'boundary_min_mm_yr': 5.,      # below this, a boundary is a transform
+    # boundary normal used to type boundaries (thirty-third pass). 'node' (as built): each node is typed by the one
+    # neighbour on another plate with the largest normal rate, so the normal is a grid direction; on the grid's
+    # staircase a transform that does not follow the grid shows normal rates of ~0.7 v against ~0.7 v of shear and is
+    # typed ridge on one step and collision or subduction on the next (pure transforms on 12 random great circles:
+    # median 30% of nodes typed transform, min 0%, at n = 48 and 217; a run's transforms 11% of node-typed boundary vs
+    # 36% of contour-typed length, scripts/boundary_lengths). 'ring': the normal toward a neighbouring plate b is the
+    # tangent direction of the sum over the node's two-ring of (x_k - x_i) (+1 on b, -1 on its own plate), the local
+    # line's normal (96-100% typed transform on the same test). No new number. Default 'ring' since the thirty-fourth
+    # pass (sweep-20261025-170555: its control passes the gates and guards on 3 seeds, node typing failed the elevation
+    # tests on 2 of 3 with young-ocean offsets -356 / -307 m); 'node' reproduces the runs before it step by step
+    'boundary_normal': 'ring',
     'hidden_steps': 3,             # overlapped crust is consumed only after this many steps under another plate
 }
 
@@ -623,6 +643,80 @@ def classify_boundaries(owner, slot, omega, xyz, nbr, score, cont, radius, vmin)
             vt = np.sqrt(max(v0*v0+v1*v1+v2*v2-conv*conv, 0.))   # boundary-parallel (shear) component
             if abs(conv) >= abs(best) or btype[i] == 0:
                 best = conv
+                if abs(conv) < max(vmin, .5*vt):
+                    btype[i] = 4; trench[i] = False
+                elif conv > 0:
+                    if cont[i] and cont[j]:
+                        btype[i] = 3
+                        trench[i] = False
+                    else:
+                        btype[i] = 2
+                        trench[i] = score[i] < score[j]
+                else:
+                    btype[i] = 1; trench[i] = False
+        rate[i] = best
+    return btype, rate, trench
+
+
+@njit(cache=True)
+def classify_boundaries_ring(owner, slot, omega, xyz, nbr, score, cont, radius, vmin):
+    """As classify_boundaries, with the boundary normal from the node's two-ring (PARAMS 'boundary_normal' 'ring'):
+    toward each neighbouring plate b, the tangent direction of sum_k (x_k - x_i) over the node's neighbours and their
+    neighbours, +1 on b and -1 on the node's own plate (other plates 0). Of the neighbouring plates, the one with the
+    largest |normal rate| types the node, as before; a trench node is the one with the lower score."""
+    n = owner.shape[0]
+    K = nbr.shape[1]
+    btype = np.zeros(n, np.int8)
+    rate = np.zeros(n)
+    trench = np.zeros(n, np.bool_)
+    ring = np.empty(K*K+K, np.int64)
+    for i in range(n):
+        a = owner[i]
+        x0, x1, x2 = xyz[i, 0], xyz[i, 1], xyz[i, 2]
+        nr = -1
+        best = 0.
+        done = False
+        for k in range(K):
+            j = nbr[i, k]
+            if j < 0 or owner[j] == a:
+                continue
+            b = owner[j]
+            seen = False                                   # each neighbouring plate once
+            for k0 in range(k):
+                j0 = nbr[i, k0]
+                if j0 >= 0 and owner[j0] == b:
+                    seen = True
+            if seen:
+                continue
+            if nr < 0:                                     # the two-ring, built once per boundary node
+                nr = 0
+                for k1 in range(K):
+                    j1 = nbr[i, k1]
+                    if j1 < 0:
+                        continue
+                    ring[nr] = j1; nr += 1
+                    for k2 in range(K):
+                        j2 = nbr[j1, k2]
+                        if j2 >= 0 and j2 != i:
+                            ring[nr] = j2; nr += 1
+            d0 = 0.; d1 = 0.; d2 = 0.
+            for r in range(nr):
+                q = ring[r]
+                sg = 1. if owner[q] == b else (-1. if owner[q] == a else 0.)
+                d0 += sg*(xyz[q, 0]-x0); d1 += sg*(xyz[q, 1]-x1); d2 += sg*(xyz[q, 2]-x2)
+            dn = d0*x0+d1*x1+d2*x2
+            d0 -= dn*x0; d1 -= dn*x1; d2 -= dn*x2
+            L = np.sqrt(d0*d0+d1*d1+d2*d2)
+            if L == 0.:
+                continue
+            sa, sb = slot[a], slot[b]
+            w0 = omega[sa, 0]-omega[sb, 0]; w1 = omega[sa, 1]-omega[sb, 1]; w2 = omega[sa, 2]-omega[sb, 2]
+            v0 = (w1*x2-w2*x1)*radius; v1 = (w2*x0-w0*x2)*radius; v2 = (w0*x1-w1*x0)*radius
+            conv = (v0*d0+v1*d1+v2*d2)/L
+            vt = np.sqrt(max(v0*v0+v1*v1+v2*v2-conv*conv, 0.))   # boundary-parallel (shear) component
+            if abs(conv) >= abs(best) or not done:
+                best = conv
+                done = True
                 if abs(conv) < max(vmin, .5*vt):
                     btype[i] = 4; trench[i] = False
                 elif conv > 0:
@@ -1416,8 +1510,12 @@ class PlateSim:
         age = self.t-self.world['born']
         score = self._score(self.world['cont'], age, share[slot[self.owner]])
         # owner may refer to plates removed this step only if they own nothing, so slot lookup is safe
-        bt, rate, trench = classify_boundaries(self.owner, slot, omega, g.xyz, g.nbr, score, self.world['cont'], g.radius,
-                                               self.p['boundary_min_mm_yr']*1e-3)
+        bn = self.p['boundary_normal']
+        if bn not in ('node', 'ring'):
+            raise ValueError(f"boundary_normal {bn!r}: 'node' or 'ring'")
+        fn = classify_boundaries_ring if bn == 'ring' else classify_boundaries
+        bt, rate, trench = fn(self.owner, slot, omega, g.xyz, g.nbr, score, self.world['cont'], g.radius,
+                              self.p['boundary_min_mm_yr']*1e-3)
         self.btype, self.conv_rate, self.trench = bt, rate, trench
 
     def _driving(self, own, speed, axis):
@@ -1682,7 +1780,8 @@ class PlateSim:
     def _start_extension(self, pl, piece, across=False):
         """Split pl along the thick piece's long axis (great circle through its centroid), or across it (along its
         short axis) for a piece convergence holds (E2, ext_held_rule 'direction'); the smaller side becomes the new
-        plate. The zone's half-width is the piece's p90 distance from the cut."""
+        plate, or with the band cut and ext_side 'free' (E4) the side whose far edge faces fewer collision nodes. The
+        zone's half-width is the piece's p90 distance from the cut."""
         g, p, w = self.g, self.p, self.world
         a = g.area[piece]; X = g.xyz[piece]
         c = (a[:, None]*X).sum(0); c /= np.linalg.norm(c)
@@ -1698,7 +1797,7 @@ class PlateSim:
         o = np.argsort(s); cw = np.cumsum(a[o]); cw /= cw[-1]
         W = float(np.clip(s[o][np.searchsorted(cw, .9)], p['rift_width_km']*1e3, p['ext_max_half_width_km']*1e3))
         own = self.owner == pl.id
-        pole = None; L = None
+        pole = None; L = None; side_info = {}
         if p['ext_cut'] == 'whole':
             side = own & (g.xyz@m > 0)
             part = side if g.area[side].sum() <= g.area[own & ~side].sum() else own & ~side
@@ -1715,8 +1814,19 @@ class PlateSim:
                 sides.append(cand & np.isin(lab, keep))
             A_ = [g.area[q].sum() if q.sum() >= 4 else np.inf for q in sides]
             k = int(A_[1] < A_[0])
+            if p['ext_side'] not in ('free', 'smaller'):
+                raise ValueError(f"ext_side {p['ext_side']!r}: 'free' or 'smaller'")
+            nb = g.nbr; okn = nb >= 0
+            on = self.owner[np.where(okn, nb, 0)]
+            fc = []                                      # collision share of each side's far edge (E4)
+            for q in sides:
+                edge = q & np.any(okn & (on != pl.id), axis=1)
+                fc.append(float(np.mean(self.btype[edge] == COLLISION)) if edge.any() and hasattr(self, 'btype') else np.nan)
+            if p['ext_side'] == 'free' and np.isfinite(fc).all() and fc[0] != fc[1] and np.isfinite(A_).all():
+                k = int(fc[1] < fc[0])
             if not np.isfinite(A_[k]):
                 return None
+            side_info = {'side': p['ext_side'], 'far_collision_sides': fc, 'moved_larger': bool(A_[k] > A_[1-k])}
             part = sides[k]
             out = (1., -1.)[k]*m                         # the part's side of the cut
             pole = u if np.cross(u, c)@out > 0 else -u   # rotation about pole moves c into the part's side
@@ -1745,12 +1855,13 @@ class PlateSim:
               'piece_mkm2': float(a.sum()/1e12), 'piece_thick_km': float(np.average(w['thick'][piece], weights=a)/1e3),
               'across': bool(across), 'hot_share': float(np.average(hot, weights=a)), 'cut_normal': m.tolist(),
               'cut': p['ext_cut'], 'L': L, 'pole': None if pole is None else pole.tolist(),
-              'pole_body': None if pole is None else (pole@pl.Q).tolist(), **far}
+              'pole_body': None if pole is None else (pole@pl.Q).tolist(), **far, **side_info}
         if p['ext_pair_motion'] == 'union':
             ev['base_speed'], ev['base_axis'] = base0
         self.ext_events.append(ev)
         self.events[-1].update({k: ev[k] for k in ('W', 'v', 'piece_mkm2', 'piece_thick_km', 'across', 'hot_share', 'cut', 'L')})
         self.events[-1].update(far)
+        self.events[-1].update(side_info)
         return ev
 
     def _split_events(self):
