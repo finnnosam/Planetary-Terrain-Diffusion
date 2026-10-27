@@ -39,6 +39,18 @@ PARAMS = {
     'cont_ref_thick_m': 38000.,    # continental crust standing at cont_ref_elev_m
     'cont_ref_elev_m': 300.,
     'rho_crust': 2830., 'rho_mantle': 3300., 'rho_water': 1030., 'rho_sediment': 2400.,
+    # sediment compaction (item B-a, thirty-sixth pass). With it, `sed` is the solid (grain) thickness, of density
+    # rho_grain, and the elevation reads the bulk thickness and mass of a column whose porosity falls with depth below
+    # its top by Athy's law, phi0 exp(-c z) (Sclater & Christie 1980: shale phi0 0.63, c 0.51 /km on oceanic crust;
+    # shaly sandstone 0.56, 0.39 /km on continental crust); pores are water-filled (below sea level, and as ground
+    # water in a dry column). A 0.5 km deep-sea cover (bulk) then stands at ~1,750 kg/m^3, a 5 km basin at ~2,250-2,300. Every
+    # ledger stays in solid volume (eroded crust becomes grain volume 1:1; the grains are 6% lighter than the crust).
+    # Within a plate step the erosion kernels move solid heights (graph_landscape unchanged, so the 11.53 km stage is
+    # untouched); the next elevation call reads bulk. False: `sed` is a layer of rho_sediment (all runs before 26 Oct).
+    # Default True since the thirty-seventh pass (sweep-20261025-201623, 3 seeds: gates pass, guards hold; deep floor
+    # 4,317 m vs Earth 4,205 +- 150, the control 4,524; ocean bulk sediment 569 m vs GlobSed 610)
+    'sediment_compaction': True, 'rho_grain': 2650.,
+    'phi0_ocean': .63, 'compaction_c_ocean_per_km': .51, 'phi0_continent': .56, 'compaction_c_continent_per_km': .39,
     # sea level from a fixed water inventory (Earth's ocean, Charette & Smith 2010): each elevation is returned relative
     # to the level that holds this volume, so a deeper or wider ocean lowers the sea instead of drowning continents.
     # Elevations are first computed on the fixed reference datum (ridges at -2,600 m, cont_ref_elev_m). None = sea
@@ -178,6 +190,18 @@ PARAMS = {
     # become one plate (as India is joining Eurasia); the smaller plate's crust moves into the larger plate's frame
     'merge_contact_km': 1000., 'merge_after_myr': 40.,
     'merge_max_ratio': .35, 'merge_max_area_mkm2': 150.,   # docking: a smaller block onto a bigger one, size-capped
+    # plate pieces (item B-b, thirty-seventh pass). A plate's world territory can fall into separate pieces (a plate
+    # growing inside another cuts its host in two; overrides at trenches); with 'shared' (as built) every piece keeps
+    # the plate's one Euler pole, thousands of km away: 6-13% of the surface at 0 Myr, 35-53% of all boundary and half
+    # the intra-oceanic trench (thirty-sixth pass). 'plates': on Earth a plate is one connected rigid piece of
+    # lithosphere. A detached piece of at least piece_min_area_mkm2 becomes its own plate (the parent's Euler vector at
+    # the split, then its own forces); a smaller one joins the plate around most of its edge, which keeps its motion
+    # (microplate capture: the Monterey, Arguello and Magdalena microplates by the Pacific plate, Nicholson et al.
+    # 1994); a piece with no interior node (a staircase crumb on a boundary, 1-5 nodes, 0.07% of the surface) is left.
+    # 1 Mkm^2: Bird's (2003) 20 plates of at least 1 Mkm^2 hold 98% of Earth's surface; the 32 smaller ones (10 Mkm^2)
+    # live in deforming zones the n = 217 grid barely resolves. Default 'plates' since the thirty-eighth pass
+    # (sweep-20261025-220434: detached max 0.0018-0.0033 of the surface vs 0.06-0.095; volume -10.8% vs -12.5%)
+    'piece_rule': 'plates', 'piece_min_area_mkm2': 1.,
     # sediment-filled ocean floor becomes continental crust (margin prisms, filled remnant basins), keeping its
     # elevation: oceanic nodes with more than basin_to_continent_sed_m of sediment, or any sediment above sea level
     'basin_to_continent_sed_m': 10000.,
@@ -286,6 +310,25 @@ PARAMS = {
     # 32.9 / 38.2 / 43.0 km), keeping its spatial structure (thicker near old sutures); the thinned rim at the coast
     # as before. Default 'earth' since the interior sweep (sweep-20261024-193840, twenty-fifth pass; 'assumed' before)
     'start_crust': 'earth',
+    # the start's plate geometry (thirty-eighth pass). 'voronoi' (as built): plates are Voronoi cells of the whole
+    # sphere, n_cont_plates seeded inside the supercontinent, so its plates reach into the ocean and its coast is a
+    # passive margin inside plates (continental-side trench at -250 Myr 0.2-0.7k km); a closed sphere consumes what it
+    # opens, so all closing is ocean-ocean (intra-oceanic trench 33-38k km at the start, 0.40 of the ocean-ocean
+    # boundary; Earth 20.8k, 0.14; thirty-seventh pass). 'coast': the same seeds grow only within their own domain
+    # (continental plates end at the coast, oceanic plates fill the ocean), so the supercontinent's rim is a plate
+    # boundary all round and its type follows from the motions (the continental plates move away from the centre, as
+    # before): converging stretches subduct ocean under the continent, diverging ones open new ocean that joins the
+    # continental plate (a passive margin). Pangea was ringed by subduction along its Panthalassa side (the Terra
+    # Australis orogen, ~18,000 km, Cawood 2005; the circum-Pangea subduction girdle, Collins 2003), with passive
+    # margins mainly on the opening Tethys side. An ocean (or continent) component without a seed gets its own plate.
+    # No new number
+    'start_plates': 'voronoi',
+    # the oceanic start plates' motion (thirty-eighth pass). 'random' (as built): random poles, 3-7 cm/yr; the force
+    # law turns them over tau_axis_myr. 'forces': each oceanic start plate gets the speed and pole the plate layer's own
+    # force law (_driving, fully relaxed) gives on the start's geometry, with the slabs Pangea had: ocean nodes on the
+    # coast are trench (the subduction ring; meaningful with start_plates 'coast') and ocean-ocean boundaries ridges
+    # (as the start's age field has them). Continental plates keep their dispersal motion. No new number
+    'start_poles': 'random',
     'v_min_cm_yr': 1.5, 'v_slab_cm_yr': 9.,  # plate speed without / with a full slab
     'slab_ref_km': 6000.,          # trench length giving the full slab-pull speed
     'v_ridge_cm_yr': 1.5,          # extra speed from ridge push with ridge_ref_km of ridge
@@ -334,6 +377,39 @@ def gdh1_depth(age_myr):
     """Ocean depth (m, positive) from lithosphere age (Stein & Stein 1992)."""
     a = np.clip(age_myr, 0, None)
     return np.where(a < 20, 2600.+365.*np.sqrt(a), 5651.-2473.*np.exp(-.0278*a))
+
+
+def bulk_thickness(S, phi0, c_per_km):
+    """Bulk thickness h (m) of a sediment column holding solid thickness S (m) when its porosity falls with depth z
+    below the top as phi0 exp(-c z) (Athy 1930): S = h - phi0 / c (1 - exp(-c h)). Newton's method from the thin-cover
+    bound S / (1 - phi0), from which it converges monotonically (the residual is convex and increasing in h)."""
+    S = np.maximum(np.asarray(S, np.float64), 0.)
+    phi0 = np.asarray(phi0, np.float64); c = np.asarray(c_per_km, np.float64)/1e3
+    h = S/(1-phi0)
+    for _ in range(50):
+        e = np.exp(-c*h)
+        f = h-phi0/c*(1-e)-S
+        h = h-f/(1-phi0*e)
+        if np.all(np.abs(f) < 1e-6):
+            break
+    return h
+
+
+def sediment_column(sed, cont, p=PARAMS):
+    """Sediment column of every node: (surface height, mass per area dry, mass per area submerged minus the water it
+    displaces). With sediment_compaction, sed is solid thickness: bulk height from bulk_thickness (shale law on oceanic
+    crust, shaly sandstone on continental crust), mass rho_grain S + rho_water (h - S) with water-filled pores, and
+    (rho_grain - rho_water) S under water. Without it, a layer of rho_sediment: (sed, rho_sediment sed,
+    (rho_sediment - rho_water) sed)."""
+    rw = p['rho_water']
+    if not p.get('sediment_compaction'):
+        rs = p['rho_sediment']
+        return sed, rs*sed, (rs-rw)*sed
+    phi0 = np.where(cont, p['phi0_continent'], p['phi0_ocean'])
+    c = np.where(cont, p['compaction_c_continent_per_km'], p['compaction_c_ocean_per_km'])
+    h = bulk_thickness(sed, phi0, c)
+    rg = p['rho_grain']
+    return h, rg*sed+rw*(h-sed), (rg-rw)*sed
 
 
 def isostatic_elevation(cont, thick, ocean_age, p=PARAMS):
@@ -794,6 +870,10 @@ class PlateSim:
             raise NotImplementedError('only the supercontinent start exists so far (dispersed start: later)')
         self._init_supercontinent(n_plates, n_cont_plates, cont_fraction)
         self.compose_from_plates()
+        if self.p['start_poles'] == 'forces':
+            self._start_poles_from_forces()
+        elif self.p['start_poles'] != 'random':
+            raise ValueError(f"start_poles {self.p['start_poles']!r}: 'random' or 'forces'")
         self.area0 = float(graph.area[self.world['cont']].sum())
 
     # ------------------------------------------------------------------ start
@@ -848,7 +928,23 @@ class PlateSim:
         lab0 = np.full(g.size, -1, np.int64); lab0[pseeds] = np.arange(n_plates)
         wig = 1+.35*fields.random_field(xyz, 10, 2., rng)
         w = np.clip(.5*(wig[:, None]+wig[np.clip(g.nbr, 0, None)]), .3, None)
-        plab, _ = nearest_label(lab0, g.nbr, g.dist*w)
+        if p['start_plates'] == 'voronoi':
+            plab, _ = nearest_label(lab0, g.nbr, g.dist*w)
+        elif p['start_plates'] == 'coast':
+            nbc = np.clip(g.nbr, 0, None)
+            same = (g.nbr >= 0) & (cont[nbc] == cont[:, None])
+            dw = np.where(same, g.dist*w, np.inf)
+            plab, _ = nearest_label(lab0, g.nbr, dw)
+            while (plab < 0).any():                      # a domain component without a seed: its own plate
+                un = plab < 0
+                comp = components(un, g.nbr)
+                first = comp == comp[np.flatnonzero(un)[0]]
+                dc = gl.distance_to(~first, g.nbr, g.dist)
+                lab0[int(np.argmax(np.where(first, dc, -1)))] = n_plates
+                n_plates += 1
+                plab, _ = nearest_label(lab0, g.nbr, dw)
+        else:
+            raise ValueError(f"start_plates {p['start_plates']!r}: 'voronoi' or 'coast'")
 
         # ocean ages: distance from initial ridges (ocean-ocean plate boundaries), half rate 3 cm/yr, cap 180 Myr
         ridge = (~cont) & self._label_boundary(~cont, plab)
@@ -870,6 +966,22 @@ class PlateSim:
             pl.thick[:] = np.where(cont, thick, p['ocean_thick_m'])
             pl.born[:] = np.where(cont, born_c, self.t-age_o)
             pl.orog[:] = np.where(cont, orog_c, np.nan)
+
+    def _start_poles_from_forces(self):
+        """start_poles 'forces': oceanic start plates move as the force law sets them on the start's geometry, with
+        coast nodes on the ocean side as trench and ocean-ocean boundary nodes as ridge."""
+        g = self.g
+        nb = g.nbr; ok = nb >= 0; nbc = np.where(ok, nb, 0)
+        c = self.world['cont']
+        other = ok & (self.owner[nbc] != self.owner[:, None])
+        trench = (~c) & np.any(other & c[nbc], 1)
+        ridge = (~c) & np.any(other & ~c[nbc], 1) & ~trench
+        self.trench, self.btype = trench, np.where(ridge, RIDGE, 0).astype(np.int8)
+        for pl in self.plates:
+            own = self.owner == pl.id
+            if own.any() and not (own & c).any():
+                pl.speed, pl.axis = self._driving(own, pl.speed, pl.axis, relax=1.)
+        del self.trench, self.btype                      # typed by motion from the first step on
 
     def _label_boundary(self, mask, lab):
         g = self.g
@@ -1042,6 +1154,10 @@ class PlateSim:
         dsed = dsed+conv_s
         self._update_rasters(dthick, idx, dsed)
         self.plates = [pl for pl in self.plates if pl.mask.any()]
+        if p['piece_rule'] == 'plates':
+            self._separate_pieces()
+        elif p['piece_rule'] != 'shared':
+            raise ValueError(f"piece_rule {p['piece_rule']!r}: 'shared' or 'plates'")
         self._classify()
         self._update_motion()
         if p['extension']:
@@ -1340,17 +1456,19 @@ class PlateSim:
         With thinning_local_isostasy, continental crust thinner than cont_ref_thick_m stands at that local Airy depth
         (plus the deflection from other loads) and is no negative load on the plate. With continental_sediment, the
         sediment on continental crust adds its thickness and loads the plate (rho_sediment; against water where its
-        top is below sea level).
+        top is below sea level). With sediment_compaction the sediment's height and mass are those of a compacting
+        column (sediment_column): bulk height on the surface, solid mass and pore water in the load.
         """
         p, w = self.p, self.world
         thick = w['thick'] if thick is None else thick
         sed = w['sed'] if sed is None else sed
         cont = w['cont']
-        rc, rm, rw, rs = p['rho_crust'], p['rho_mantle'], p['rho_water'], p['rho_sediment']
+        rc, rm, rw = p['rho_crust'], p['rho_mantle'], p['rho_water']
+        sh, sm_dry, sm_wet = sediment_column(sed, cont, p)       # height, dry mass, submerged excess mass (per area)
         anomaly = np.where(cont, thick-p['cont_ref_thick_m'], thick-p['ocean_thick_m'])
         ocean_age = np.where(cont, 0., self.t-w['born'])
         s0 = getattr(self, 'sea_level', 0.)                     # previous sea level on the datum (loads use it)
-        above = (-gdh1_depth(ocean_age)+anomaly+sed) > s0       # oceanic crust built above sea level (arcs, fills)
+        above = (-gdh1_depth(ocean_age)+anomaly+sh) > s0        # oceanic crust built above sea level (arcs, fills)
         # thinning_local_isostasy: the thinned part (negative anomaly) of continental crust stands at its local Airy
         # level and is no load on the plate; the thickened part loads it as before
         thin = np.where(cont, np.minimum(anomaly, 0.), 0.) if p['thinning_local_isostasy'] else 0.
@@ -1358,12 +1476,15 @@ class PlateSim:
         own_airy = p['cont_ref_elev_m']+anomaly*(rm-rc)/rm-s0
         # continental_sediment: sediment on continental crust is a load like ocean-floor sediment, dry where its top
         # (on the crust's own water-loaded Airy level, the ocean rule's counterpart) stands above sea level
-        cs = np.where(cont, sed, 0.) if p['continental_sediment'] else np.zeros_like(anomaly)
+        zero = np.zeros_like(anomaly)
+        cs = np.where(cont, sh, 0.) if p['continental_sediment'] else zero
+        cs_dry = np.where(cont, sm_dry, 0.) if p['continental_sediment'] else zero
+        cs_wet = np.where(cont, sm_wet, 0.) if p['continental_sediment'] else zero
         c_dry = cont & (np.where(own_airy < 0, own_airy*rm/(rm-rw), own_airy)+cs > 0)
-        dry = np.where(cont, rc*load+np.where(c_dry, rs*cs, 0.), np.where(above, rc*anomaly+rs*sed, 0.))
-        wet = np.where(cont, np.where(c_dry, 0., (rs-rw)*cs), np.where(above, 0., (rc-rw)*anomaly+(rs-rw)*sed))
+        dry = np.where(cont, rc*load+np.where(c_dry, cs_dry, 0.), np.where(above, rc*anomaly+sm_dry, 0.))
+        wet = np.where(cont, np.where(c_dry, 0., cs_wet), np.where(above, 0., (rc-rw)*anomaly+sm_wet))
         defl = self.flex_dry.deflection(dry)+self.flex_wet.deflection(wet)
-        z = np.where(cont, p['cont_ref_elev_m']+load+thin*(rm-rc)/rm+cs, -gdh1_depth(ocean_age)+anomaly+sed)-defl
+        z = np.where(cont, p['cont_ref_elev_m']+load+thin*(rm-rc)/rm+cs, -gdh1_depth(ocean_age)+anomaly+sh)-defl
         z = z+np.where(cont & (own_airy < 0), own_airy*rw/(rm-rw), 0.)
         z = z+self.dyn                                    # dynamic topography: non-load surface motion
         if p['water_volume_km3'] is None:
@@ -1381,7 +1502,7 @@ class PlateSim:
         collision volume is added as volume. Plate nodes the world does not read keep their values."""
         g, w, p = self.g, self.world, self.p
         a = g.area
-        wns, owns, consumed = [], [], []
+        wns, owns, consumed, booked = [], [], [], []
         dVc = np.zeros(g.size)                          # collision volume arriving at world nodes (m^3)
         collided = np.zeros(g.size, bool)
         subducted = np.zeros(g.size, bool)
@@ -1416,6 +1537,8 @@ class PlateSim:
             self.area_ledger['subduction'] -= float(a[lost].sum())
             L['cont_subducted'] -= float((pl.thick[lost]*a[lost]).sum())
             wns.append(wn); owns.append(own); consumed.append(gone)
+            g1 = gone & pl.cont                          # booked above at their values now (pass 2 may still change them)
+            booked.append((cc, np.where(g1, pl.thick, 0.).astype(np.float64), np.where(g1, pl.sed, 0.).astype(np.float64)))
         self.collided, self.subducted = collided, subducted
         if hasattr(self, 'tectonic'):
             self.tectonic = self.tectonic+dVc/a          # collision volume, as thickness at the receiving world node
@@ -1484,6 +1607,17 @@ class PlateSim:
             pl.under[new] = 0
             self.ledger['new_nodes'] += float((pl.thick[new]*a[new]*pl.cont[new]).sum())
             self.sed_ledger['new_nodes'] += float((pl.sed[new]*a[new]*pl.cont[new]).sum())
+            # consumed nodes can still be read by a world node of this plate (the forward and backward maps are not
+            # exact inverses) and get this step's increments, or become continental (arcs), after pass 1 booked them:
+            # book what leaves with them at its value now (thirty-eighth pass; ledgers only, the fields are unchanged)
+            cc1, th1, sd1 = booked[k]
+            now_c = gone & pl.cont
+            d_th = (np.where(now_c, pl.thick, 0.).astype(np.float64)-th1)*a
+            d_sd = (np.where(now_c, pl.sed, 0.).astype(np.float64)-sd1)*a
+            self.ledger['collision_out'] -= float(d_th[cc1].sum())
+            self.ledger['cont_subducted'] -= float(d_th[~cc1].sum())
+            self.sed_ledger['collision_out'] -= float(d_sd[cc1].sum())
+            self.sed_ledger['cont_subducted'] -= float(d_sd[~cc1].sum())
             pl.mask[gone] = False
             pl.mask[new] = True
             pl.cont[~pl.mask] = False
@@ -1497,8 +1631,12 @@ class PlateSim:
                 self.area_ledger['holes'] = self.area_ledger.get('holes', 0.)+float(a[hole & pl.cont].sum())
                 self.sed_ledger['holes'] += float((pl.sed[hole]*a[hole]*pl.cont[hole]).sum())
             self.holes_filled = getattr(self, 'holes_filled', 0)+int(hole.sum())
-        # collision volume that reached a world node no plate node reads is lost (counted)
-        self.ledger['cont_lost_other'] -= float(dVc[self.new_crust].sum())
+        # collision volume that reached a world node no plate node reads is lost. Its removal is already booked in
+        # pass 1 (collision_out) and what arrives is booked as increments, so it is counted here, not booked again
+        # (until the thirty-eighth pass it was also booked as ledger 'cont_lost_other': a double count)
+        self.erosion_totals['collision_volume_unread_m3'] = self.erosion_totals.get('collision_volume_unread_m3', 0.)+float(
+            dVc[self.new_crust].sum())
+        self._wn = {pl.id: wn for pl, wn in zip(self.plates, wns)}   # raster -> world maps (B-b reuses them)
 
     def _classify(self):
         g = self.g
@@ -1518,7 +1656,7 @@ class PlateSim:
                               self.p['boundary_min_mm_yr']*1e-3)
         self.btype, self.conv_rate, self.trench = bt, rate, trench
 
-    def _driving(self, own, speed, axis):
+    def _driving(self, own, speed, axis, relax=None):
         """The usual forces on the plate made of the world nodes own, one step from its speed and axis: the speed
         relaxes toward the target set by slab pull, ridge push, continental drag and collision resistance, and the pole
         turns so the plate moves toward its trenches (slab pull) and away from its ridges (ridge push). Returns the new
@@ -1537,11 +1675,11 @@ class PlateSim:
         target = (p['v_min_cm_yr']+(p['v_slab_cm_yr']-p['v_min_cm_yr'])*min(1., L_slab/p['slab_ref_km'])
                   + p['v_ridge_cm_yr']*min(1., L_ridge/p['ridge_ref_km']))
         target *= (1-p['cont_drag']*cf)/(1+L_coll/p['collision_ref_km'])
-        speed = speed+(target-speed)*min(1., dt/p['tau_speed_myr'])
+        speed = speed+(target-speed)*(min(1., dt/p['tau_speed_myr']) if relax is None else relax)
         pull = np.cross(c, g.xyz[tr]).sum(0)+p['ridge_torque']*np.cross(g.xyz[ri], c).sum(0)
         nrm = np.linalg.norm(pull)
         if nrm > 0:
-            b = min(1., dt/p['tau_axis_myr'])
+            b = min(1., dt/p['tau_axis_myr']) if relax is None else relax
             a = (1-b)*axis+b*pull/nrm
             axis = a/np.linalg.norm(a)
         return speed, axis
@@ -1667,6 +1805,130 @@ class PlateSim:
         self.sed_ledger['merge'] += self.continental_sediment_volume()-vs0
         self.events.append({'t': self.t, 'kind': 'merge', 'plate': int(big.id), 'merged': int(small.id),
                             'area_mkm2': float(a_small/1e12)})
+
+    # ------------------------------------------------------------------ plate pieces (B-b)
+    def plate_pieces(self):
+        """Every plate's world territory as connected pieces: (plate, component labels, piece areas m^2, index of
+        the largest piece) for each plate that owns nodes."""
+        g = self.g
+        out = []
+        for pl in self.plates:
+            own = self.owner == pl.id
+            if not own.any():
+                continue
+            lab = components(own, g.nbr)
+            sz = np.bincount(lab[lab >= 0], weights=g.area[lab >= 0])
+            out.append((pl, lab, sz, int(np.argmax(sz))))
+        return out
+
+    def detached_area(self):
+        """World area (m^2) of the plate pieces other than each plate's largest."""
+        return float(sum(sz.sum()-sz[m] for _, _, sz, m in self.plate_pieces()))
+
+    def _separate_pieces(self):
+        """piece_rule 'plates' (B-b): each detached piece with an interior node (all its neighbours on the same
+        plate) becomes its own plate if it covers at least piece_min_area_mkm2, else joins the plate around most of
+        its edge (_weld). Pieces of plates in a running extension event are left to E."""
+        g, p = self.g, self.p
+        floor = p['piece_min_area_mkm2']*1e12
+        busy = set()
+        for ev in self.ext_events:
+            busy |= {ev['parent'], ev['child']}
+        nb = np.where(g.nbr >= 0, g.nbr, np.arange(g.size)[:, None])
+        st = self.piece_stats = getattr(self, 'piece_stats', {'plates_made': 0, 'welds': 0, 'welded_m2': 0.,
+                                                             'crumbs_m2_steps': 0.})
+        small = []
+        for pl, lab, sz, main in self.plate_pieces():
+            if sz.size < 2 or pl.id in busy:
+                continue
+            ids_all = np.flatnonzero(lab >= 0)
+            o = ids_all[np.argsort(lab[ids_all], kind='stable')]
+            cuts = np.searchsorted(lab[o], np.arange(sz.size+1))
+            for c in range(sz.size):
+                if c == main:
+                    continue
+                ids = o[cuts[c]:cuts[c+1]]
+                if not (self.owner[nb[ids]] == pl.id).all(1).any():
+                    st['crumbs_m2_steps'] += float(g.area[ids].sum())
+                    continue
+                if sz[c] >= floor:
+                    part = np.zeros(g.size, bool); part[ids] = True
+                    new = self.split(pl, part, 0., 'detach')
+                    if new is not None:
+                        self._wn[new.id] = self._wn[pl.id]          # same frame: same raster -> world map
+                        st['plates_made'] += 1
+                        continue
+                small.append((pl.id, ids))
+        groups = {}
+        for sid, ids in small:                       # after the splits: the surrounding plate may be a new one
+            nn = g.nbr[ids]
+            o = self.owner[np.where(nn >= 0, nn, 0)]
+            ok = (nn >= 0) & (o != sid)
+            if not ok.any():
+                continue
+            u, cnt = np.unique(o[ok], return_counts=True)
+            groups.setdefault((sid, int(u[np.argmax(cnt)])), []).append(ids)
+        byid = {q.id: q for q in self.plates}
+        for (sid, did), parts in groups.items():
+            if sid in byid and did in byid:
+                ids = np.concatenate(parts)
+                self._weld(byid[sid], byid[did], ids)
+                st['welds'] += 1
+                st['welded_m2'] += float(g.area[ids].sum())
+
+    def _weld(self, src, dst, ids):
+        """Move the world nodes ids (a piece of src) into dst's raster, as merge does for a whole plate: dst's raster
+        nodes whose world position is on the piece read src's crust there (backward lookup); where dst already holds
+        crust under it, src's crust replaces dst's oceanic crust (subducted) and stacks on its continental crust
+        (collision, as merge); dst keeps its motion. Volume changes go to the 'pieces' ledgers."""
+        g = self.g
+        a = g.area
+        part = np.zeros(g.size, bool); part[ids] = True
+        wd, ws = self._wn[dst.id], self._wn[src.id]
+        k = np.flatnonzero(part[wd])                     # dst raster nodes on the piece
+        ro = np.flatnonzero(src.mask & part[ws])         # src raster nodes on the piece
+
+        def vol(pl, r, f):
+            return float((f[r].astype(np.float64)*a[r]*(pl.mask[r] & pl.cont[r])).sum())
+        names = ('cont', 'thick', 'born', 'orog', 'sed', 'ext', 'thk')
+        v0 = vol(src, ro, src.thick)+vol(dst, k, dst.thick)
+        s0 = vol(src, ro, src.sed)+vol(dst, k, dst.sed)
+        if k.size:
+            j = fields.nearest_nodes(g, (g.xyz[k]@dst.Q.T)@src.Q)
+            ok = src.mask[j]
+            k1, j1 = k[ok], j[ok]
+            free = ~dst.mask[k1]
+            take = free | ~dst.cont[k1]
+            stack = ~take & src.cont[j1]
+            kt, jt = k1[take], j1[take]
+            for name in names:
+                getattr(dst, name)[kt] = getattr(src, name)[jt]
+            dst.mask[kt] = True
+            dst.under[kt] = 0
+            ks, js = k1[stack], j1[stack]
+            np.add.at(dst.thick, ks, src.thick[js])
+            if self.p['continental_sediment']:
+                np.add.at(dst.sed, ks, src.sed[js])
+            for _ in range(3):                           # cracks: copy from a set neighbour (as merge's seam fill)
+                need = k[~dst.mask[k]]
+                if not need.size:
+                    break
+                nn = g.nbr[need]
+                m = (nn >= 0) & dst.mask[np.where(nn >= 0, nn, 0)]
+                has = m.any(1)
+                if not has.any():
+                    break
+                sn = np.take_along_axis(nn, np.argmax(m, 1)[:, None], 1)[:, 0]
+                nd, sn = need[has], sn[has]
+                for name in names:
+                    arr = getattr(dst, name); arr[nd] = arr[sn]
+                dst.mask[nd] = True
+                dst.under[nd] = 0
+        src.mask[ro] = False
+        src.cont[ro] = False
+        self.ledger['pieces'] = self.ledger.get('pieces', 0.)+vol(src, ro, src.thick)+vol(dst, k, dst.thick)-v0
+        self.sed_ledger['pieces'] = self.sed_ledger.get('pieces', 0.)+vol(src, ro, src.sed)+vol(dst, k, dst.sed)-s0
+        self.owner = np.where(part, dst.id, self.owner)
 
     # ------------------------------------------------------------------ extension of thick crust (E)
     def _pair(self, ev):
@@ -1932,6 +2194,7 @@ class PlateSim:
                 'boundary_type': self.btype if hasattr(self, 'btype') else np.zeros(self.g.size, np.int8),
                 'convergence_mm_yr': (self.conv_rate*1e3).astype(np.float32) if hasattr(self, 'conv_rate') else np.zeros(self.g.size, np.float32),
                 'elevation_m': elev.astype(np.float32), 'sediment_m': w['sed'].astype(np.float32),
+                'sediment_bulk_m': sediment_column(w['sed'], w['cont'], self.p)[0].astype(np.float32),
                 'dynamic_topography_m': self.dyn.astype(np.float32), 'new_crust': self.new_crust,
                 'sea_level_m': np.float32(getattr(self, 'sea_level', 0.)),
                 'tectonic_thickening_m': getattr(self, 'tectonic', np.zeros(self.g.size)).astype(np.float32),
