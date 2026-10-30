@@ -38,7 +38,9 @@ planet_diffusion/data
 data/
 
 # Local examples, experiments, and verification material
-# (scripts/, tests/, docs/ and *.cmd are tracked since 29 Oct 2026)
+# (scripts/, tests/ and docs/ are tracked; personal launch and working scripts are not)
+*.cmd
+*.bat
 human_input/
 todo_prompts_etc/
 Commands.txt

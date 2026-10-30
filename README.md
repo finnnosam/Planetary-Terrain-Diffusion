@@ -2,6 +2,20 @@
 
 Generate global or regional elevation GeoTIFFs with [Terrain Diffusion](https://github.com/xandergos/terrain-diffusion). Run these commands from the project folder in PowerShell.
 
+## Where the planet work went
+
+Since 29 October 2026 this repository holds only this generator. The simulated-planet chain built on top of it
+(plates and crust history, landscape evolution, the 23 km to 2.88 km meso model, the Earth references and the
+reviews) is now [Planetary_Diffusion](https://github.com/finnnosam/Planetary_Diffusion), with its history.
+
+Everything as it was on the day of the split, including the learned-layout and structure models of September and
+early October 2026 (`planet_training/`), their scripts, tests and docs, is kept in this repository's tag
+`pre-split-2026-10-29`:
+
+```powershell
+git checkout pre-split-2026-10-29
+```
+
 ## Install
 
 Install Python 3.11 or 3.12 **with Tcl/Tk** (needed for the desktop UI) and Git. On Windows, for example:
@@ -107,9 +121,7 @@ Elevation output is one float32 band in metres. Climate output bands are tempera
 
 ## Desktop UI
 
-For the custom elevation-only meso model, use `Launch Meso.cmd`. It launches the corrected tiled sampler with only that model's supported settings; see [the meso UI instructions](toy_meso/README.md#desktop-ui-for-the-fixed-model).
-
-Double-click `Launch Planet.cmd` or run `.venv\Scripts\python.exe -m planet_diffusion gui`. **Generate / Resume** uses the run folder and current settings; **Stop** keeps completed checkpoints. **New run** selects a fresh folder; **Open run folder** opens it. For **Saved run query**, choose a completed run folder or its `state` folder, enter bounds and output dimensions, then click **Query saved run**.
+Run `.venv\Scripts\python.exe -m planet_diffusion gui`. **Generate / Resume** uses the run folder and current settings; **Stop** keeps completed checkpoints. **New run** selects a fresh folder; **Open run folder** opens it. For **Saved run query**, choose a completed run folder or its `state` folder, enter bounds and output dimensions, then click **Query saved run**.
 
 Click **Load settings…** and choose an existing run's `launch.json` to restore its seed, inputs, resolution, bounds, model, and compute settings. The selected file's folder becomes the run folder, and the saved guide height is kept as **Custom**. Loading does not start generation. Click **Generate / Resume** to continue an interrupted run, or **New run** to reuse the settings in a fresh folder. Older launch files are supported; options without launcher controls are listed in a warning and use launcher defaults.
 
