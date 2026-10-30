@@ -1,0 +1,9 @@
+# Versions used for local verification; CPU PyTorch on Windows, Python 3.12.
+numpy==2.5.3
+rasterio==1.5.1
+torch==2.14.0
+diffusers==0.40.0
+safetensors==0.8.0
+huggingface-hub==1.33.0
+pytest==9.1.1
+Pillow==12.3.0

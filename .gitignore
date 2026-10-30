@@ -38,14 +38,10 @@ planet_diffusion/data
 data/
 
 # Local examples, experiments, and verification material
+# (scripts/, tests/, docs/ and *.cmd are tracked since 29 Oct 2026)
 human_input/
 todo_prompts_etc/
-tests/
-scripts/
-docs/
-requirements-tested.txt
 Commands.txt
-*.cmd
 
 # Local AI and editor state
 .agents/

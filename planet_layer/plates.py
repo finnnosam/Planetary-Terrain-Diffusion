@@ -125,6 +125,29 @@ PARAMS = {
     'foreland_d0_km': 350., 'foreland_sigma_km': 100.,
     'arc_H_ocean_m': 300., 'arc_d0_km': 150., 'arc_sigma_km': 50.,
     'arc_to_continent_thick_m': 20000.,
+    # B-d (thirty-ninth pass): arc crust docks instead of subducting. With arc_accretion, oceanic crust thicker than
+    # ocean_thick_m that a trench consumes hands its excess to the overriding plate's node as volume (as collision
+    # volume): all of it where the column is at least arc_buoyant_thick_m (Cloos 1993: island arcs thicker than ~15 km
+    # are buoyant enough to collide), else its upper arc_accrete_upper_m (Tetreault & Buiter 2014, Solid Earth 5: "only
+    # the upper 2-5 km of arc crust are accreted onto continents through thin-skinned thrusting"); the normal 7 km of
+    # basement subducts. Received on continental crust it is an arc-continent collision (orogeny marked). Default off
+    # until a sweep decides.
+    'arc_accretion': False, 'arc_buoyant_thick_m': 15000., 'arc_accrete_upper_m': 3500.,
+    # B-d2 (fortieth pass): what feeds the trench fluxes (continental and island arcs, subduction erosion). 'band': each
+    # overriding trench node adds closing rate x H x a Gaussian in trench distance, so the flux follows the node-typed
+    # trench, which on the planet's rough boundaries runs 1.2-2.7x the true line (ocean arcs 1.7-2.7x the contour's
+    # intra-oceanic consumption; on three of six seeds more arc crust than the whole planet's subduction consumed).
+    # 'consumed': the oceanic area a trench consumed last step (m^2, at the world node it disappeared under) goes to the
+    # nearest overriding trench node of that plate; each term adds area x H, spread over that node's band with its
+    # Gaussian, normalized over the band (so a straight trench gets the 'band' law with v = consumed area / length).
+    # Earth's H values are per m of convergence per m of trench, i.e. per m^2 consumed. Default 'band' until a sweep decides.
+    'trench_flux': 'band',
+    # B-d2 (fortieth pass): which side of an ocean-ocean subduction boundary is the trench (downgoing) side. 'node': each
+    # node by its own crust age against its neighbour's (as built); the overlap resolution meanwhile consumes crust by one
+    # polarity per plate pair (_ocean_polarity), and the two disagree at ~22% of oceanic overriding-typed nodes (seed 1001,
+    # -245..-178 Myr): arcs grow on the downgoing plate and slab pull goes to the overriding one there. 'pair': where the
+    # pair overlapped this step, the node follows that polarity; elsewhere the node rule. Default 'node' until a sweep decides.
+    'trench_polarity': 'node',
     # subduction erosion: the trench removes crust from the base of the overriding plate near it (forearc), the
     # main continental loss balancing arc growth on Earth (~1.3-1.7 km^3/yr); flux = convergence x H_se. On oceanic
     # crust only arc crust above ocean_thick_m can be removed
@@ -689,6 +712,60 @@ def plate_holes(mask, nbr):
     return hole, src
 
 
+def spread_to_band(vol, near, d, band, d0, sg, area):
+    """Thickness (m) that spreads the volumes vol (m^3 at nodes) over the arc band of each one's nearest trench node:
+    Gaussian in trench distance d at d0 +- sg over the band nodes with the same nearest trench node, normalized so the
+    volume is conserved. A volume whose trench node has no band node stays where it is (B-d, thirty-ninth pass)."""
+    n = vol.size
+    out = np.zeros(n)
+    src = np.flatnonzero(vol > 0)
+    if src.size == 0:
+        return out
+    key = np.where(near >= 0, near, -1)
+    V = np.zeros(n); np.add.at(V, key[src][key[src] >= 0], vol[src][key[src] >= 0])
+    wgt = np.where(band & (key >= 0), np.exp(-.5*((d-d0)/sg)**2), 0.)
+    S = np.zeros(n); np.add.at(S, np.where(wgt > 0, key, 0), wgt*area*(wgt > 0))
+    has = (wgt > 0) & (S[np.clip(key, 0, None)] > 0)
+    out[has] = V[key[has]]*wgt[has]/S[key[has]]
+    lone = (key[src] < 0) | (S[np.clip(key[src], 0, None)] <= 0)          # no band: stays on its node
+    out[src[lone]] += vol[src[lone]]/area[src[lone]]
+    return out
+
+
+def trench_flux_consumed(A, near, d, ok, terms, area, min_len, own, nbr, dist):
+    """Trench fluxes from consumed area (trench_flux 'consumed', B-d2, fortieth pass). A: oceanic area (m^2) consumed
+    at each world node last step; near / d: nearest overriding trench node and the distance to it; ok: nodes of that
+    node's plate within reach. Each consumed area is routed to the nearest overriding trench node of its plate that owns
+    a band (Gaussian integral at arc_d0 150 +- 50 km over its band >= min_len; on a staircase boundary the outer row owns
+    almost none), only where ok (consumption with no overriding trench of the receiving plate in reach, e.g. overlap at a
+    transform, feeds nothing). own / nbr / dist: plate of each node and the graph. terms: (mask, H, d0, sg); each
+    adds A_s x H on its mask's nodes of the band of s, weighted by its Gaussian in d and normalized by the Gaussian's
+    integral over the whole band of s (all of its ok nodes), floored at min_len (m; a truncated band keeps the share it
+    has, as the 'band' law does). Returns the thickness change (m) and the routed and unrouted areas (m^2)."""
+    n = area.size
+    out = np.zeros(n)
+    if A is None or not (A > 0).any():
+        return out, 0., 0.
+    key = np.where(ok, near, -1)
+    ref = np.exp(-.5*((d-150e3)/50e3)**2)/(50e3*np.sqrt(2*np.pi))
+    owns_band = np.bincount(key[ok], weights=(ref*area)[ok], minlength=n) >= min_len
+    near2, _ = nearest_label(np.where(owns_band, np.arange(n), -1).astype(np.int64), nbr, dist)
+    to = np.where(ok & (near2 >= 0), near2, -1)
+    to[to >= 0] = np.where(own[to[to >= 0]] == own[to >= 0], to[to >= 0], -1)
+    got = (A > 0) & (to >= 0)
+    As = np.bincount(to[got], weights=A[got], minlength=n)
+    routed, unrouted = float(A[got].sum()), float(A[(A > 0) & ~got].sum())
+    kk = np.clip(key, 0, None)
+    for mask, H, d0, sg in terms:
+        if H == 0:
+            continue
+        shape = np.exp(-.5*((d-d0)/sg)**2)/(sg*np.sqrt(2*np.pi))
+        norm = np.bincount(key[ok], weights=(shape*area)[ok], minlength=n)
+        norm = np.maximum(norm, min_len)
+        out = out+np.where(mask & ok, As[kk]*H*shape/norm[kk], 0.)
+    return out, routed, unrouted
+
+
 @njit(cache=True)
 def classify_boundaries(owner, slot, omega, xyz, nbr, score, cont, radius, vmin):
     """Boundary type, convergence rate (m/yr, + = closing) and trench flag of every node. A boundary whose normal
@@ -1018,9 +1095,11 @@ class PlateSim:
         real subduction zones keep their polarity."""
         ocean_only = (nclaim >= 2) & ~(claimed & cont_k).any(0)
         if not ocean_only.any():
+            self.polarity_now = {}
             return top
         pid = np.array([pl.id for pl in self.plates])
         pol = getattr(self, 'polarity', {})
+        now = self.polarity_now = {}                     # this step's pairs (B-d2, trench_polarity 'pair'): (lo id, hi id) -> over
         cols = np.flatnonzero(ocean_only)
         cl = claimed[:, cols]
         K = len(self.plates)
@@ -1035,6 +1114,7 @@ class PlateSim:
                     ya = age_k[a, cols[both]].mean(); yb = age_k[b, cols[both]].mean()
                     pol[key] = pid[a] if ya <= yb else pid[b]
                 over = a if pol[key] == pid[a] else b
+                now[(min(pid[a], pid[b]), max(pid[a], pid[b]))] = pol[key]
                 wins[over] += both
         self.polarity = pol
         best = np.argmax(np.where(cl, wins, -1), 0)
@@ -1313,13 +1393,27 @@ class PlateSim:
         cont = w['cont']
         shorten = p['margin_shortening']
         H_cont = p['arc_H_cont_m'] if shorten else p['subduction_H_cont_m']
-        for mask, H, d0, sg in ((ok & cont, H_cont, p['subduction_d0_cont_km']*1e3, p['subduction_sigma_cont_km']*1e3),
-                                (ok & ~cont, p['arc_H_ocean_m'], p['arc_d0_km']*1e3, p['arc_sigma_km']*1e3),
-                                (ok, -p['subduction_erosion_H_m'], p['subduction_erosion_d0_km']*1e3, p['subduction_erosion_sigma_km']*1e3)):
-            if H == 0:
-                continue
-            shape = np.exp(-.5*((d-d0)/sg)**2)/(sg*np.sqrt(2*np.pi))
-            out = out+np.where(mask, v*H*shape*dt, 0.)
+        terms = ((ok & cont, H_cont, p['subduction_d0_cont_km']*1e3, p['subduction_sigma_cont_km']*1e3),
+                 (ok & ~cont, p['arc_H_ocean_m'], p['arc_d0_km']*1e3, p['arc_sigma_km']*1e3),
+                 (ok, -p['subduction_erosion_H_m'], p['subduction_erosion_d0_km']*1e3, p['subduction_erosion_sigma_km']*1e3))
+        mode = p['trench_flux']
+        if mode == 'band':
+            for mask, H, d0, sg in terms:
+                if H == 0:
+                    continue
+                shape = np.exp(-.5*((d-d0)/sg)**2)/(sg*np.sqrt(2*np.pi))
+                out = out+np.where(mask, v*H*shape*dt, 0.)
+        elif mode == 'consumed':
+            A = getattr(self, 'consumed_pending', None)
+            self.consumed_pending = np.zeros(g.size)
+            f, routed, unrouted = trench_flux_consumed(A, near, d, ok, terms, g.area, .5*np.sqrt(g.area.mean()),
+                                                       self.owner, g.nbr, g.dist)
+            out = out+f
+            ET = self.erosion_totals
+            ET['trench_flux_routed_m2'] = ET.get('trench_flux_routed_m2', 0.)+routed
+            ET['trench_flux_unrouted_m2'] = ET.get('trench_flux_unrouted_m2', 0.)+unrouted
+        else:
+            raise ValueError(f"trench_flux {mode!r}: 'band' or 'consumed'")
         # erosion takes at most 30% of a continental column per step; on oceanic crust it removes only arc crust built
         # above the normal 7 km (an intra-oceanic forearc), never the oceanic basement: unbounded, it dug pits to
         # -10 km that trailed behind moving trenches (step 7 run)
@@ -1331,6 +1425,12 @@ class PlateSim:
         for key, m in (('subduction_on_continents_m3', cont), ('subduction_on_ocean_arcs_m3', ~cont)):
             self.erosion_totals[key] = self.erosion_totals.get(key, 0.)+float((out*g.area)[m].sum())
         self.erosion_totals['subduction_added_m3'] = self.erosion_totals.get('subduction_added_m3', 0.)+float((out*g.area).sum())
+        dock = getattr(self, 'dock_pending', None)   # B-d: arc crust docked on oceanic overriding plates last step
+        if dock is not None and dock.any():          # (moved crust, not new: kept out of the arc-growth totals)
+            dt_dock = spread_to_band(dock, near, d, ok & ~cont, p['arc_d0_km']*1e3, p['arc_sigma_km']*1e3, g.area)
+            self.erosion_totals['arc_docked_spread_m3'] = self.erosion_totals.get('arc_docked_spread_m3', 0.)+float((dt_dock*g.area).sum())
+            out = out+dt_dock
+            self.dock_pending = np.zeros(g.size)
         if shorten:
             s_rate = self._shortening_rate(src)                     # m/yr per overriding trench node
             moved = margin_shortening(near, d, ok & cont, s_rate[np.clip(near, 0, None)], w['thick']+out, g.area, dt,
@@ -1441,6 +1541,9 @@ class PlateSim:
                 (e_oc*a).sum())
             self.erosion_totals['ocean_crust_eroded_subaerial_m3'] = self.erosion_totals.get(
                 'ocean_crust_eroded_subaerial_m3', 0.)+float((e_oc*a)[z0 > 0].sum())
+            normal = (z0 > 0) & (thick < p['ocean_thick_m']+1000.)    # the old leak: normal oceanic crust above sea
+            self.erosion_totals['ocean_crust_eroded_subaerial_normal_m3'] = self.erosion_totals.get(
+                'ocean_crust_eroded_subaerial_normal_m3', 0.)+float((e_oc*a)[normal].sum())
             e_cont = e_cont+e_oc
         return e_cont, dsed
 
@@ -1524,6 +1627,27 @@ class PlateSim:
             SL['collision_out'] -= float((pl.sed[cc]*a[cc]).sum())
             SL['cont_subducted'] -= float((pl.sed[gone & pl.cont & ~w['cont'][wn]]*a[gone & pl.cont & ~w['cont'][wn]]).sum())
             subducted[wn[gone & ~pl.cont]] = True
+            if p['trench_flux'] == 'consumed':           # B-d2: the oceanic area consumed feeds next step's trench fluxes
+                if getattr(self, 'consumed_pending', None) is None:
+                    self.consumed_pending = np.zeros(g.size)
+                oc_all = gone & ~pl.cont
+                np.add.at(self.consumed_pending, wn[oc_all], a[oc_all])
+            if p['arc_accretion']:                        # B-d: buoyant arc crust docks on the overriding plate
+                oc = gone & ~pl.cont & (pl.thick > p['ocean_thick_m'])
+                ex = pl.thick[oc].astype(np.float64)-p['ocean_thick_m']
+                acc = np.where(pl.thick[oc] >= p['arc_buoyant_thick_m'], ex, np.minimum(ex, p['arc_accrete_upper_m']))
+                on_c = w['cont'][wn[oc]]
+                np.add.at(dVc, wn[oc][on_c], (acc*a[oc])[on_c])  # on continental crust: collision volume, as now
+                # on an oceanic overriding plate the docked crust joins that plate's arc: it is spread next step over
+                # the arc band (arc_d0_km +- arc_sigma_km) of the nearest overriding trench node, volume conserved
+                # (placed on the single receiving node it made one-node spikes that turned continental as specks)
+                if not hasattr(self, 'dock_pending'):
+                    self.dock_pending = np.zeros(g.size)
+                np.add.at(self.dock_pending, wn[oc][~on_c], (acc*a[oc])[~on_c])
+                collided[wn[oc][on_c]] = True
+                ET = self.erosion_totals
+                ET['arc_accreted_m3'] = ET.get('arc_accreted_m3', 0.)+float((acc*a[oc]).sum())
+                ET['arc_accreted_on_continent_m3'] = ET.get('arc_accreted_on_continent_m3', 0.)+float((acc*a[oc])[on_c].sum())
             sg = gone & ~pl.cont & (pl.sed > 0)          # trench sediment: part is scraped onto the overriding plate
             np.add.at(dVc, wn[sg], p['sediment_accretion']*pl.sed[sg].astype(np.float64)*a[sg])
             self.erosion_totals['sediment_accreted_m3'] = self.erosion_totals.get('sediment_accreted_m3', 0.)+float(
@@ -1580,10 +1704,11 @@ class PlateSim:
             vs1 = self._plate_cont_sed(pl)
             self.sed_ledger['increments'] += vs1-vs
             conv = self.new_continent[ws] if hasattr(self, 'new_continent') else np.zeros(ws.size, bool)
-            if conv.any():
-                pl.cont[js[conv]] = True
-                pl.orog[js[conv]] = self.t
-                self.ledger['arc_continent'] = self.ledger.get('arc_continent', 0.)+float((pl.thick[js[conv]]*a[js[conv]]).sum())
+            if conv.any():                              # each plate node once: two world nodes can read the same one
+                uc = np.unique(js[conv])                   # (booked twice until the thirty-ninth pass; ledger only)
+                pl.cont[uc] = True
+                pl.orog[uc] = self.t
+                self.ledger['arc_continent'] = self.ledger.get('arc_continent', 0.)+float((pl.thick[uc]*a[uc]).sum())
                 self.sed_ledger['arc_continent'] += self._plate_cont_sed(pl)-vs1
             hit = np.zeros(g.size, bool); hit[js[marked[ws]]] = True
             pl.orog[hit] = self.t
@@ -1654,7 +1779,40 @@ class PlateSim:
         fn = classify_boundaries_ring if bn == 'ring' else classify_boundaries
         bt, rate, trench = fn(self.owner, slot, omega, g.xyz, g.nbr, score, self.world['cont'], g.radius,
                               self.p['boundary_min_mm_yr']*1e-3)
+        tp = self.p['trench_polarity']
+        if tp == 'pair':
+            trench = self._pair_polarity(bt, trench)
+        elif tp != 'node':
+            raise ValueError(f"trench_polarity {tp!r}: 'node' or 'pair'")
         self.btype, self.conv_rate, self.trench = bt, rate, trench
+
+    def _pair_polarity(self, bt, trench):
+        """trench_polarity 'pair' (B-d2): oceanic subduction nodes facing an oceanic node of another plate take the
+        polarity the overlap resolution used for that pair this step (the overriding plate's nodes are not trench nodes,
+        the other plate's are); pairs that did not overlap keep the node rule."""
+        g = self.g
+        now = getattr(self, 'polarity_now', {})
+        if not now:
+            return trench
+        own, cont = self.owner, self.world['cont']
+        I = np.flatnonzero((bt == SUBDUCTION) & ~cont)
+        if I.size == 0:
+            return trench
+        nb = g.nbr[I]
+        nbc = np.clip(nb, 0, None)
+        oth = (nb >= 0) & (own[nbc] != own[I, None]) & ~cont[nbc]
+        has = oth.any(1)
+        J = nbc[np.arange(I.size), np.argmax(oth, 1)]
+        I, J = I[has], J[has]
+        a, b = own[I], own[J]
+        win = np.array([now.get((int(x), int(y)), -1) for x, y in zip(np.minimum(a, b), np.maximum(a, b))], np.int64)
+        m = win >= 0
+        out = trench.copy()
+        out[I[m]] = win[m] != a[m]
+        self.erosion_totals['polarity_flipped_nodes'] = self.erosion_totals.get('polarity_flipped_nodes', 0)+int(
+            (out[I[m]] != trench[I[m]]).sum())
+        self.erosion_totals['polarity_pair_nodes'] = self.erosion_totals.get('polarity_pair_nodes', 0)+int(m.sum())
+        return out
 
     def _driving(self, own, speed, axis, relax=None):
         """The usual forces on the plate made of the world nodes own, one step from its speed and axis: the speed
