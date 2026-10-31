@@ -89,7 +89,7 @@ def test_random_seed_cli_and_saved_draft(tmp_path,monkeypatch):
         with pytest.raises(ValueError): resolve_seed(bad)
     path = png(tmp_path,np.full((4,8),255,np.uint8))
     assert main(["generate","--backend","diagnostic","--draft",str(path),
-                 "--coarse-height","4","--coarse-steps","2","--height","32","--keep-checkpoints",
+                 "--coarse-height","4","--coarse-steps","2","--height","32",
                  "--state",str(tmp_path/"state"),"--output",str(tmp_path/"map.tif")]) == 0
     _,meta = load_state(tmp_path/"state")
     assert meta["seed"] == 123456

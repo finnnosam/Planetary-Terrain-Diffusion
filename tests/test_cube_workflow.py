@@ -36,7 +36,7 @@ def test_all_stages_use_shared_cube_nodes_and_resume(tmp_path):
 
 def test_cli_defaults_to_cube(tmp_path):
     assert main(["generate", "--backend", "diagnostic", "--seed", "42",
-                 "--coarse-height", "4", "--coarse-steps", "2", "--height", "64", "--keep-checkpoints",
+                 "--coarse-height", "4", "--coarse-steps", "2", "--height", "64",
                  "--state", str(tmp_path/"state"), "--output", str(tmp_path/"map.tif")]) == 0
     _, meta = load_state(tmp_path/"state")
     assert meta["algorithm"] == "cubed-sphere-v3"
